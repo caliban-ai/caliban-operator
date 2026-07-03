@@ -1,0 +1,10 @@
+[package]
+name = "caliban-operator"
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Kubernetes operator (kube-rs) for caliban agent workloads (scaffolding — see caliban-ai/caliban#282)"
+repository = "https://github.com/caliban-ai/caliban-operator"
+publish = false
+
+[dependencies]
