@@ -242,4 +242,17 @@ mod tests {
         assert!(d.sandbox_ref.is_none());
         assert!(d.caliband_endpoint.is_none());
     }
+
+    #[test]
+    fn cleared_endpoint_and_ref_serialize_as_null_for_merge_delete() {
+        // A status with a running endpoint, then cleared back to Pending.
+        let mut t = task_without_status();
+        let sb = sandbox_with_fqdn(Some("refactor-auth-sbx.team-a.svc"));
+        t.status = super::derive_status(&t, Some(&sb), &Settings::default());
+        let cleared = super::derive_status(&t, None, &Settings::default()).unwrap();
+        let v = serde_json::to_value(&cleared).unwrap();
+        // Merge-patch needs explicit null (not absent) to delete the stale values.
+        assert!(v.get("calibandEndpoint").is_some_and(|x| x.is_null()));
+        assert!(v.get("sandboxRef").is_some_and(|x| x.is_null()));
+    }
 }

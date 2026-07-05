@@ -107,6 +107,14 @@ fn caliband_env(t: &CalibanTask, s: &Settings) -> Vec<EnvVar> {
     {
         e.push(env("GONZALO_ENDPOINT", ep));
     }
+    if let Some(r) = t
+        .spec
+        .model
+        .as_ref()
+        .and_then(|m| m.router_config_ref.clone())
+    {
+        e.push(env("CALIBAN_ROUTER_CONFIG_REF", r));
+    }
     e
 }
 
@@ -304,6 +312,8 @@ mod tests {
             |e| e.name == "CALIBAND_LISTEN" && e.value.as_deref() == Some("tcp://0.0.0.0:8443")
         ));
         assert!(env.iter().any(|e| e.name == "CALIBAN_WORKSPACE_ROOT"));
+        // No model configured in the default fixture → no router-config env.
+        assert!(!env.iter().any(|e| e.name == "CALIBAN_ROUTER_CONFIG_REF"));
         // Workspace PVC present.
         let pvcs = sb.spec.volume_claim_templates.unwrap();
         assert_eq!(pvcs[0].metadata.name.as_deref(), Some("workspace"));
@@ -336,6 +346,20 @@ mod tests {
                 .as_deref(),
             Some("gvisor")
         );
+    }
+
+    #[test]
+    fn sandbox_projects_router_config_ref_env_when_model_set() {
+        use crate::crd::ModelSpec;
+        let mut t = task();
+        t.spec.model = Some(ModelSpec {
+            router_config_ref: Some("caliban-router".into()),
+        });
+        let sb = build_sandbox(&t, &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let env = pod.containers[0].env.as_ref().unwrap();
+        assert!(env.iter().any(|e| e.name == "CALIBAN_ROUTER_CONFIG_REF"
+            && e.value.as_deref() == Some("caliban-router")));
     }
 
     #[test]

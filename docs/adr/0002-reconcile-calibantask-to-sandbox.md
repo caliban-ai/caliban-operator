@@ -75,9 +75,12 @@ Forces:
 5. **NetworkPolicy: default-deny with the minimal working allowances.** The
    per-task `NetworkPolicy` selects the Sandbox's pod labels and sets
    `policyTypes: [Ingress, Egress]` with: deny-all by default, **allow DNS egress**
-   (UDP/TCP 53), **allow general egress** (git clone + provider APIs; MVP allows
-   egress to all non-cluster destinations), and **allow ingress on the caliband
-   port** (8443) from the task's namespace. The spec's finer rules
+   (UDP/TCP 53), **allow general egress** (git clone + provider APIs; the empty-`to`
+   rule allows egress to all destinations at MVP, in-cluster included — restricting
+   it to non-cluster CIDRs is deferred because it would require an
+   environment-specific cluster CIDR, a home-cluster identifier we don't bake in),
+   and **allow ingress on the caliband port** (8443) from the task's namespace. The
+   spec's finer rules
    (prospero→caliband, pod→gonzalo) require cross-namespace identity the CR does
    not carry generically at MVP; they are parameterized in a later iteration. The
    MVP ships a real, cluster-agnostic default-deny posture (selectors are the

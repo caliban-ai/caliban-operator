@@ -143,10 +143,19 @@ pub struct CalibanTaskStatus {
     #[serde(default)]
     pub phase: Phase,
     /// caliband session endpoint (host:port), once the Sandbox is ready.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // No `skip_serializing_if` here (unlike most optional status fields):
+    // `derive_status` transitions this back to `None` when the backing
+    // Sandbox disappears, and the status patch uses JSON Merge Patch
+    // (RFC 7396), where an *omitted* key is left unchanged on the server but
+    // an explicit `null` deletes it. Serializing `None` as `null` is required
+    // so a stale endpoint doesn't survive the merge. (`//` not `///` so this
+    // doesn't leak into the generated CRD schema description.)
+    #[serde(default)]
     pub caliband_endpoint: Option<String>,
     /// The agent-sandbox Sandbox backing this task.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // See the note on `caliband_endpoint` above: no `skip_serializing_if`,
+    // for the same merge-patch-delete-via-null reason.
+    #[serde(default)]
     pub sandbox_ref: Option<NamedRef>,
     /// Latest checkpoint reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
