@@ -1,0 +1,217 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: calibantasks.caliban.caliban-ai.dev
+spec:
+  group: caliban.caliban-ai.dev
+  names:
+    categories: []
+    kind: CalibanTask
+    plural: calibantasks
+    shortNames:
+    - ctask
+    singular: calibantask
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for CalibanTaskSpec via `CustomResource`
+        properties:
+          spec:
+            description: 'Desired state of a caliban task: a workspace of sources + the task to run.'
+            properties:
+              isolation:
+                description: Sandbox isolation configuration.
+                nullable: true
+                properties:
+                  runtimeClass:
+                    description: RuntimeClass (e.g. `gvisor`, `kata`).
+                    nullable: true
+                    type: string
+                  worktrees:
+                    description: Worktree isolation strategy (e.g. `per-source`).
+                    nullable: true
+                    type: string
+                type: object
+              lifecycle:
+                description: Idle/drain lifecycle policy.
+                nullable: true
+                properties:
+                  idleTimeout:
+                    description: Idle timeout before pause (e.g. `30m`).
+                    nullable: true
+                    type: string
+                  onDelete:
+                    description: 'On delete: `checkpoint` or `delete`.'
+                    nullable: true
+                    type: string
+                type: object
+              model:
+                description: Model-router configuration.
+                nullable: true
+                properties:
+                  routerConfigRef:
+                    description: Name of a ConfigMap holding the router config.
+                    nullable: true
+                    type: string
+                type: object
+              resources:
+                description: 'Resource class → a SandboxTemplate (consumed in #283).'
+                nullable: true
+                properties:
+                  class:
+                    description: Named resource class (e.g. `standard`).
+                    nullable: true
+                    type: string
+                type: object
+              state:
+                description: Persistence (gonzalo) configuration.
+                nullable: true
+                properties:
+                  gonzaloEndpoint:
+                    description: gonzalod endpoint the pod uses for shared state.
+                    nullable: true
+                    type: string
+                  mode:
+                    description: '`remote` (shared gonzalod) or `local` (in-pod).'
+                    nullable: true
+                    type: string
+                type: object
+              task:
+                description: The task itself.
+                properties:
+                  agentType:
+                    description: Agent type (e.g. `general-purpose`).
+                    nullable: true
+                    type: string
+                  prompt:
+                    description: Initial prompt.
+                    type: string
+                required:
+                - prompt
+                type: object
+              workspace:
+                description: The workspace (1..N source checkouts) the task runs over.
+                properties:
+                  services:
+                    default: []
+                    description: Optional in-pod aux services (e.g. gonzalod, prosperod) for e2e.
+                    items:
+                      type: string
+                    type: array
+                  sources:
+                    description: The guaranteed source checkouts (runtime-extensible).
+                    items:
+                      description: A single source checkout in the workspace.
+                      properties:
+                        name:
+                          description: Source identifier (matches caliband's workspace source name).
+                          type: string
+                        path:
+                          description: Absolute mount path in the pod (e.g. `/work/caliban`).
+                          type: string
+                        ref:
+                          default: main
+                          description: Git ref to check out. Defaults to `main`.
+                          type: string
+                        repo:
+                          description: Git remote to clone.
+                          type: string
+                      required:
+                      - name
+                      - path
+                      - repo
+                      type: object
+                    type: array
+                required:
+                - sources
+                type: object
+            required:
+            - task
+            - workspace
+            type: object
+          status:
+            description: Observed state of a `CalibanTask`.
+            nullable: true
+            properties:
+              calibandEndpoint:
+                description: caliband session endpoint (host:port), once the Sandbox is ready.
+                nullable: true
+                type: string
+              checkpointRef:
+                description: Latest checkpoint reference.
+                nullable: true
+                type: string
+              conditions:
+                description: Standard Kubernetes conditions.
+                items:
+                  description: A minimal Kubernetes-style condition.
+                  properties:
+                    message:
+                      description: Human-readable message.
+                      nullable: true
+                      type: string
+                    reason:
+                      description: Machine-readable reason.
+                      nullable: true
+                      type: string
+                    status:
+                      description: '`True` / `False` / `Unknown`.'
+                      type: string
+                    type:
+                      description: Condition type (e.g. `Ready`).
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              phase:
+                default: Pending
+                description: Lifecycle phase.
+                enum:
+                - Pending
+                - Provisioning
+                - Running
+                - Draining
+                - Completed
+                - Failed
+                type: string
+              sandboxRef:
+                description: The agent-sandbox Sandbox backing this task.
+                nullable: true
+                properties:
+                  name:
+                    description: Object name.
+                    type: string
+                required:
+                - name
+                type: object
+              workspace:
+                description: Observed workspace (incl. runtime-added sources).
+                nullable: true
+                properties:
+                  materialized:
+                    default: []
+                    description: Source names observed materialized in the pod.
+                    items:
+                      type: string
+                    type: array
+                type: object
+            type: object
+        required:
+        - spec
+        title: CalibanTask
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

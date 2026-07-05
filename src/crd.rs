@@ -287,6 +287,17 @@ spec:
     }
 
     #[test]
+    fn committed_crd_yaml_is_in_sync() {
+        let generated = serde_yaml::to_string(&CalibanTask::crd()).unwrap();
+        let committed = include_str!("../deploy/crd/calibantask.yaml");
+        assert_eq!(
+            generated.trim(),
+            committed.trim(),
+            "deploy/crd/calibantask.yaml is stale — regenerate: cargo run --bin crdgen > deploy/crd/calibantask.yaml"
+        );
+    }
+
+    #[test]
     fn minimal_cr_defaults() {
         // Only required fields; optional blocks absent.
         let yaml = r#"

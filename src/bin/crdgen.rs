@@ -1,3 +1,9 @@
-//! CRD YAML generator entrypoint. Filled in Task 3.
+//! Emit the CalibanTask CRD YAML: `cargo run --bin crdgen > deploy/crd/calibantask.yaml`.
 
-fn main() {}
+use kube::CustomResourceExt;
+
+fn main() -> anyhow::Result<()> {
+    let crd = caliban_operator::crd::CalibanTask::crd();
+    print!("{}", serde_yaml::to_string(&crd)?);
+    Ok(())
+}
