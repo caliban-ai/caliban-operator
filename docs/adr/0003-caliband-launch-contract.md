@@ -66,3 +66,6 @@ the caliban image's Dockerfile:
   (`serviceFQDN:<port>`) works; per-agent attach dialing from outside the pod (prospero's
   session plane) needs `--advertise-host <serviceFQDN>` + per-agent port routing — a
   follow-up paired with prospero #77.
+- **`git clone --depth 1 --branch <ref>` accepts branch/tag names only, not commit
+  SHAs** — a `ref` set to a raw commit SHA will fail the clone (the CRD's `ref` defaults
+  to `main`; SHA-pinning is a follow-up).

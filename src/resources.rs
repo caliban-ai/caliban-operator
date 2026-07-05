@@ -110,6 +110,11 @@ fn caliband_env(t: &CalibanTask) -> Vec<EnvVar> {
     e
 }
 
+/// POSIX single-quote a value for safe interpolation into `/bin/sh -c`.
+fn sh_squote(v: &str) -> String {
+    format!("'{}'", v.replace('\'', "'\\''"))
+}
+
 /// Build the idempotent clone script for the init container: for each workspace
 /// source, clone `repo` at `ref` into `path` unless it's already a git checkout
 /// (so pause/resume and pod restarts over the persistent PVC don't refetch).
@@ -117,8 +122,11 @@ fn clone_script(t: &CalibanTask) -> String {
     let mut s = String::from("set -eu\n");
     for src in &t.spec.workspace.sources {
         s.push_str(&format!(
-            "if [ ! -d '{path}/.git' ]; then git clone --depth 1 --branch '{r}' '{repo}' '{path}'; fi\n",
-            path = src.path, r = src.r#ref, repo = src.repo,
+            "if [ ! -d {git} ]; then git clone --depth 1 --branch {r} {repo} {path}; fi\n",
+            git = sh_squote(&format!("{}/.git", src.path)),
+            r = sh_squote(&src.r#ref),
+            repo = sh_squote(&src.repo),
+            path = sh_squote(&src.path),
         ));
     }
     s
@@ -400,6 +408,18 @@ mod tests {
             script.contains("git clone --depth 1 --branch 'main' 'git@x:caliban' '/work/caliban'")
         );
         assert!(script.contains("[ ! -d '/work/caliban/.git' ]"));
+    }
+
+    #[test]
+    fn clone_script_shell_escapes_source_values() {
+        let mut t = task();
+        t.spec.workspace.sources[0].repo = "https://x/a'b".into();
+        let sb = build_sandbox(&t, &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let init = &pod.init_containers.unwrap()[0];
+        let script = &init.command.as_ref().unwrap()[2];
+        assert!(script.contains("'https://x/a'\\''b'"));
+        assert!(!script.contains("'https://x/a'b'"));
     }
 
     #[test]
