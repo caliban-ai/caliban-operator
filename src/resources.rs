@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, PersistentVolumeClaim, PersistentVolumeClaimSpec, PodSpec,
-    PodTemplateSpec, ServiceAccount, VolumeMount, VolumeResourceRequirements,
+    Container, ContainerPort, EnvVar, PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec,
+    ServiceAccount, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -19,7 +19,7 @@ use kube::ResourceExt;
 
 use crate::config::{common_labels, netpol_name, owner_ref, sa_name, sandbox_name, Settings};
 use crate::crd::CalibanTask;
-use crate::sandbox::{Sandbox, SandboxSpec};
+use crate::sandbox::{Sandbox, SandboxSpec, VolumeClaimTemplate};
 
 fn child_meta(t: &CalibanTask, name: String, labels: BTreeMap<String, String>) -> ObjectMeta {
     ObjectMeta {
@@ -155,8 +155,8 @@ fn clone_init_container(t: &CalibanTask, s: &Settings) -> Option<Container> {
     })
 }
 
-fn workspace_pvc(s: &Settings) -> PersistentVolumeClaim {
-    PersistentVolumeClaim {
+fn workspace_pvc(s: &Settings) -> VolumeClaimTemplate {
+    VolumeClaimTemplate {
         metadata: ObjectMeta {
             name: Some(WORKSPACE_VOLUME.to_string()),
             ..Default::default()
@@ -173,7 +173,6 @@ fn workspace_pvc(s: &Settings) -> PersistentVolumeClaim {
             // storageClassName unset → cluster default (cluster-agnostic).
             ..Default::default()
         }),
-        ..Default::default()
     }
 }
 
