@@ -31,14 +31,17 @@ Constraints and forces:
 ## Decision
 
 1. **Controller stack: kube-rs.** Depend on `kube` (features `runtime`, `derive`,
-   `client`) + `k8s-openapi` (feature `v1_31`, matching the target k3s) +
-   `schemars` (CRD schema generation) + `tokio` + `serde`/`serde_json` +
-   `serde_yaml` (CRD YAML emission) + `thiserror` + `tracing` + `futures`. Exact
-   compatible versions are resolved with `cargo add` (which honors kube's
-   `k8s-openapi` pairing) and then pinned in `Cargo.lock`; we do not hand-pick the
-   kube/k8s-openapi pair. `v1_31` is the API-surface floor; it works against k3s
-   v1.31 and newer clusters (Kubernetes API compatibility is forward-tolerant for
-   the core objects we use).
+   `client`) + `k8s-openapi` (feature `v1_32`) + `schemars` (CRD schema
+   generation) + `tokio` + `serde`/`serde_json` + `serde_yaml` (CRD YAML
+   emission) + `thiserror` + `tracing` + `futures`. Exact compatible versions are
+   resolved with `cargo add` (which honors kube's `k8s-openapi` pairing) and then
+   pinned in `Cargo.lock`; we do not hand-pick the kube/k8s-openapi pair. The
+   resolved pair is **kube 4.0 + k8s-openapi 0.28**, whose lowest offered API
+   feature is `v1_32` (there is no `v1_31` for this pairing). `v1_32` is the
+   compiled API surface; it is forward-compatible with the target **k3s v1.31**
+   apiserver for the objects we use (CRD `apiextensions.k8s.io/v1`, core objects,
+   and the agent-sandbox CRDs consumed in #283) — the Kubernetes API is tolerant
+   across a one-minor skew for these.
 
 2. **API: `caliban.caliban-ai.dev/v1alpha1`, kind `CalibanTask`, namespaced, with a
    status subresource.** Defined via `#[derive(CustomResource, …)]` on a
@@ -70,10 +73,11 @@ Constraints and forces:
   iterate the API through P2/P3 without conversion machinery.
 - **Negative:** `v1alpha1` means the CR shape can break between releases with no
   automated migration — acceptable pre-1.0, but every CR author is exposed to it.
-  Pinning `k8s-openapi` to `v1_31` ties the compiled API surface to that release;
+  Pinning `k8s-openapi` to `v1_32` ties the compiled API surface to that release;
   bumping it later is a deliberate, tested change. Committing generated YAML adds a
   keep-in-sync test that must be run when the types change (the test is the guard).
 - **Revisit if:** the API stabilizes enough to warrant `v1beta1`/`v1` + a conversion
   webhook; the target cluster's Kubernetes version moves far enough that the
-  `v1_31` `k8s-openapi` floor needs raising; or agent-sandbox's own API (consumed
-  from #283) forces a different `k8s-openapi` pairing.
+  `v1_32` `k8s-openapi` surface needs raising (or drops below the tolerated skew
+  with k3s v1.31); or agent-sandbox's own API (consumed from #283) forces a
+  different `k8s-openapi` pairing.
