@@ -6,13 +6,13 @@
 
 **Architecture:** A single `caliban-operator` binary built on kube-rs. `CalibanTaskSpec`/`CalibanTaskStatus` (via `#[derive(CustomResource)]`) mirror the design spec's CR; a `crdgen` binary emits the CRD YAML (committed + kept in sync by a test); the controller watches `CalibanTask` and its reconcile only initializes status. Real reconcile (→ agent-sandbox `Sandbox`) is #283. See ADR 0001.
 
-**Tech Stack:** Rust 1.95, `kube` (runtime/derive/client), `k8s-openapi` (v1_31), `schemars`, tokio, serde, serde_yaml, thiserror, tracing, futures.
+**Tech Stack:** Rust 1.95, `kube` (runtime/derive/client), `k8s-openapi` (v1_32), `schemars`, tokio, serde, serde_yaml, thiserror, tracing, futures.
 
 ## Global Constraints
 
 - **ADR 0001 governs:** API group `caliban.caliban-ai.dev`, version `v1alpha1`, kind `CalibanTask`, **namespaced**, **status subresource**. `v1alpha1` = unstable API, no conversion webhooks.
 - **CRD YAML is generated from the Rust types** (crdgen), committed, and a test asserts the committed file is in sync (regenerate-and-compare) — the Rust struct is the single source of truth.
-- **kube/k8s-openapi versions are resolved with `cargo add`** (which honors kube's k8s-openapi pairing), not hand-picked; pin whatever resolves. `k8s-openapi` feature `v1_31`.
+- **kube/k8s-openapi versions are resolved with `cargo add`** (which honors kube's k8s-openapi pairing), not hand-picked; pin whatever resolves. `k8s-openapi` feature `v1_32`.
 - **Field naming:** YAML is camelCase (k8s convention); Rust structs are snake_case with `#[serde(rename_all = "camelCase")]`. `ref` is a Rust keyword → `#[serde(rename = "ref")] r#ref` or a renamed field.
 - **#282 creates NO Kubernetes objects.** The reconcile only sets status. No Sandbox/RBAC/NetworkPolicy (that's #283).
 - CI is the standard gate: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build --workspace --all-targets`, `cargo test --workspace`. No `unwrap()`/`expect()` in non-test code.
@@ -46,7 +46,7 @@
 
 ```bash
 cargo add kube --features runtime,derive,client
-cargo add k8s-openapi --features v1_31 --no-default-features
+cargo add k8s-openapi --features v1_32 --no-default-features
 cargo add schemars
 cargo add tokio --features macros,rt-multi-thread
 cargo add serde --features derive
@@ -646,4 +646,4 @@ git commit -m "feat(operator): CalibanTask controller skeleton — reconcile set
 
 **3. Type consistency:** `CalibanTask`/`CalibanTaskSpec`/`CalibanTaskStatus`/`Phase` (Task 2) consumed by `crdgen` (Task 3) and `controller` (Task 4). `desired_status(Option<&CalibanTaskStatus>) -> Option<CalibanTaskStatus>` defined + tested + called consistently in Task 4.
 
-**Carry-overs to flag in the whole-branch review:** (a) the live "operator watches + sets Pending" acceptance is only proven at deploy/QA (no cluster in CI) — the whole-branch review should confirm the CI-testable surface is as strong as it can be and that the deploy-time check is documented; (b) `k8s-openapi` is pinned to `v1_31` — note the resolved kube/k8s-openapi versions in the PR; (c) #283 will consume `CalibanTask` + the agent-sandbox CRD (external schema — a real dependency to resolve before #283).
+**Carry-overs to flag in the whole-branch review:** (a) the live "operator watches + sets Pending" acceptance is only proven at deploy/QA (no cluster in CI) — the whole-branch review should confirm the CI-testable surface is as strong as it can be and that the deploy-time check is documented; (b) `k8s-openapi` is pinned to `v1_32` — note the resolved kube/k8s-openapi versions in the PR; (c) #283 will consume `CalibanTask` + the agent-sandbox CRD (external schema — a real dependency to resolve before #283).
