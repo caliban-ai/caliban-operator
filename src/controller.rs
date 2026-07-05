@@ -34,11 +34,13 @@ pub struct Context {
 /// The pure status decision (unit-testable; see tests).
 pub(crate) fn desired_status(current: Option<&CalibanTaskStatus>) -> Option<CalibanTaskStatus> {
     match current {
-        Some(s) if s.phase != Phase::Pending || s.caliband_endpoint.is_some() => None,
-        _ => Some(CalibanTaskStatus {
+        // No status yet: initialize to Pending (#282). Once any status exists —
+        // Pending or progressed by #283's reconcile — leave it untouched.
+        None => Some(CalibanTaskStatus {
             phase: Phase::Pending,
             ..Default::default()
         }),
+        Some(_) => None,
     }
 }
 
@@ -83,17 +85,36 @@ mod tests {
     use crate::crd::{CalibanTaskStatus, Phase};
 
     #[test]
-    fn initializes_missing_status_to_pending() {
+    fn initializes_absent_status_to_pending() {
         let d = super::desired_status(None).expect("should set status");
         assert_eq!(d.phase, Phase::Pending);
     }
 
     #[test]
-    fn leaves_progressed_status_untouched() {
+    fn leaves_running_status_untouched() {
         let running = CalibanTaskStatus {
             phase: Phase::Running,
             ..Default::default()
         };
         assert!(super::desired_status(Some(&running)).is_none());
+    }
+
+    #[test]
+    fn does_not_repatch_already_pending_status() {
+        let pending = CalibanTaskStatus {
+            phase: Phase::Pending,
+            ..Default::default()
+        };
+        assert!(super::desired_status(Some(&pending)).is_none());
+    }
+
+    #[test]
+    fn leaves_pending_with_endpoint_untouched() {
+        let pending_with_endpoint = CalibanTaskStatus {
+            phase: Phase::Pending,
+            caliband_endpoint: Some("10.0.0.1:9000".to_string()),
+            ..Default::default()
+        };
+        assert!(super::desired_status(Some(&pending_with_endpoint)).is_none());
     }
 }
