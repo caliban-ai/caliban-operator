@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::ServiceAccount;
 use k8s_openapi::api::networking::v1::{
-    NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPort,
-    NetworkPolicySpec,
+    NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
+    NetworkPolicyPort, NetworkPolicySpec,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -57,7 +57,10 @@ pub fn build_network_policy(t: &CalibanTask, s: &Settings) -> NetworkPolicy {
             // Ingress: caliband port only.
             ingress: Some(vec![NetworkPolicyIngressRule {
                 ports: Some(vec![np_port("TCP", s.caliband_port)]),
-                ..Default::default()
+                from: Some(vec![NetworkPolicyPeer {
+                    pod_selector: Some(LabelSelector::default()),
+                    ..Default::default()
+                }]),
             }]),
             // Egress: DNS (53 UDP+TCP), then everything else (git/providers).
             egress: Some(vec![
@@ -125,10 +128,16 @@ mod tests {
             &vec!["Ingress".to_string(), "Egress".to_string()]
         );
         // Ingress allows the caliband port.
-        let iports = spec.ingress.unwrap()[0].ports.clone().unwrap();
+        let ingress = spec.ingress.unwrap();
+        let iports = ingress[0].ports.clone().unwrap();
         assert!(iports
             .iter()
             .any(|p| p.port == Some(IntOrString::Int(8443))));
+        // Ingress is scoped to the task's own namespace (same-namespace peer).
+        let peers = ingress[0].from.clone().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert!(peers[0].pod_selector.is_some());
+        assert!(peers[0].namespace_selector.is_none());
         // Egress: DNS rule + an allow-all rule (empty `to`).
         let egress = spec.egress.unwrap();
         assert_eq!(egress.len(), 2);
