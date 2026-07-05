@@ -4,17 +4,22 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::ServiceAccount;
+use k8s_openapi::api::core::v1::{
+    Container, ContainerPort, EnvVar, PersistentVolumeClaim, PersistentVolumeClaimSpec, PodSpec,
+    PodTemplateSpec, ServiceAccount, VolumeMount, VolumeResourceRequirements,
+};
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
     NetworkPolicyPort, NetworkPolicySpec,
 };
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::ResourceExt;
 
-use crate::config::{common_labels, netpol_name, owner_ref, sa_name, Settings};
+use crate::config::{common_labels, netpol_name, owner_ref, sa_name, sandbox_name, Settings};
 use crate::crd::CalibanTask;
+use crate::sandbox::{Sandbox, SandboxSpec};
 
 fn child_meta(t: &CalibanTask, name: String, labels: BTreeMap<String, String>) -> ObjectMeta {
     ObjectMeta {
@@ -72,6 +77,111 @@ pub fn build_network_policy(t: &CalibanTask, s: &Settings) -> NetworkPolicy {
             ]),
         }),
     }
+}
+
+const WORKSPACE_VOLUME: &str = "workspace";
+
+fn env(name: &str, value: String) -> EnvVar {
+    EnvVar {
+        name: name.to_string(),
+        value: Some(value),
+        ..Default::default()
+    }
+}
+
+fn caliband_env(t: &CalibanTask, s: &Settings) -> Vec<EnvVar> {
+    let sources = serde_json::to_string(&t.spec.workspace.sources).unwrap_or_else(|_| "[]".into());
+    let mut e = vec![
+        env(
+            "CALIBAND_LISTEN",
+            format!("tcp://0.0.0.0:{}", s.caliband_port),
+        ),
+        env("CALIBAN_WORKSPACE_ROOT", s.workspace_root.clone()),
+        env("CALIBAN_WORKSPACE_SOURCES", sources),
+    ];
+    if let Some(ep) = t
+        .spec
+        .state
+        .as_ref()
+        .and_then(|st| st.gonzalo_endpoint.clone())
+    {
+        e.push(env("GONZALO_ENDPOINT", ep));
+    }
+    e
+}
+
+fn workspace_pvc(t: &CalibanTask, s: &Settings) -> PersistentVolumeClaim {
+    let _ = t;
+    PersistentVolumeClaim {
+        metadata: ObjectMeta {
+            name: Some(WORKSPACE_VOLUME.to_string()),
+            ..Default::default()
+        },
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+            resources: Some(VolumeResourceRequirements {
+                requests: Some(BTreeMap::from([(
+                    "storage".to_string(),
+                    Quantity(s.workspace_storage.clone()),
+                )])),
+                ..Default::default()
+            }),
+            // storageClassName unset → cluster default (cluster-agnostic).
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Map a `CalibanTask` to its backing agent-sandbox `Sandbox`.
+pub fn build_sandbox(t: &CalibanTask, s: &Settings) -> Sandbox {
+    let labels = common_labels(t);
+    let container = Container {
+        name: "caliband".to_string(),
+        image: Some(s.caliband_image.clone()),
+        ports: Some(vec![ContainerPort {
+            container_port: s.caliband_port,
+            name: Some("caliband".to_string()),
+            ..Default::default()
+        }]),
+        env: Some(caliband_env(t, s)),
+        volume_mounts: Some(vec![VolumeMount {
+            name: WORKSPACE_VOLUME.to_string(),
+            mount_path: s.workspace_root.clone(),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let pod_spec = PodSpec {
+        containers: vec![container],
+        runtime_class_name: t
+            .spec
+            .isolation
+            .as_ref()
+            .and_then(|i| i.runtime_class.clone()),
+        service_account_name: Some(sa_name(t)),
+        automount_service_account_token: Some(false),
+        ..Default::default()
+    };
+    let mut sb = Sandbox::new(
+        &sandbox_name(t),
+        SandboxSpec {
+            pod_template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(labels.clone()),
+                    ..Default::default()
+                }),
+                spec: Some(pod_spec),
+            },
+            service: Some(true),
+            operating_mode: Some("Running".to_string()),
+            volume_claim_templates: Some(vec![workspace_pvc(t, s)]),
+        },
+    );
+    sb.metadata.namespace = t.namespace();
+    sb.metadata.labels = Some(labels);
+    sb.metadata.owner_references = Some(vec![owner_ref(t)]);
+    sb
 }
 
 #[cfg(test)]
@@ -149,5 +259,64 @@ mod tests {
             .match_labels
             .unwrap()
             .contains_key("caliban.caliban-ai.dev/task"));
+    }
+
+    #[test]
+    fn sandbox_has_caliband_container_pvc_and_service() {
+        let s = Settings::default();
+        let sb = build_sandbox(&task(), &s);
+        assert_eq!(sb.metadata.name.as_deref(), Some("refactor-auth-sbx"));
+        assert_eq!(sb.metadata.namespace.as_deref(), Some("team-a"));
+        assert_eq!(sb.spec.service, Some(true));
+        let pod = sb.spec.pod_template.spec.unwrap();
+        assert_eq!(
+            pod.service_account_name.as_deref(),
+            Some("refactor-auth-sa")
+        );
+        assert_eq!(pod.automount_service_account_token, Some(false));
+        let c = &pod.containers[0];
+        assert_eq!(
+            c.image.as_deref(),
+            Some("ghcr.io/caliban-ai/caliban:latest")
+        );
+        assert_eq!(c.ports.as_ref().unwrap()[0].container_port, 8443);
+        // Env projects the listen addr + workspace root.
+        let env = c.env.as_ref().unwrap();
+        assert!(env.iter().any(
+            |e| e.name == "CALIBAND_LISTEN" && e.value.as_deref() == Some("tcp://0.0.0.0:8443")
+        ));
+        assert!(env.iter().any(|e| e.name == "CALIBAN_WORKSPACE_ROOT"));
+        // Workspace PVC present.
+        let pvcs = sb.spec.volume_claim_templates.unwrap();
+        assert_eq!(pvcs[0].metadata.name.as_deref(), Some("workspace"));
+        // Pod carries the managed labels (so the NetworkPolicy selects it).
+        assert!(sb
+            .spec
+            .pod_template
+            .metadata
+            .unwrap()
+            .labels
+            .unwrap()
+            .contains_key("caliban.caliban-ai.dev/task"));
+    }
+
+    #[test]
+    fn sandbox_runtime_class_from_isolation() {
+        use crate::crd::IsolationSpec;
+        let mut t = task();
+        t.spec.isolation = Some(IsolationSpec {
+            runtime_class: Some("gvisor".into()),
+            worktrees: None,
+        });
+        let sb = build_sandbox(&t, &Settings::default());
+        assert_eq!(
+            sb.spec
+                .pod_template
+                .spec
+                .unwrap()
+                .runtime_class_name
+                .as_deref(),
+            Some("gvisor")
+        );
     }
 }
