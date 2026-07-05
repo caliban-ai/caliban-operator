@@ -89,16 +89,8 @@ fn env(name: &str, value: String) -> EnvVar {
     }
 }
 
-fn caliband_env(t: &CalibanTask, s: &Settings) -> Vec<EnvVar> {
-    let sources = serde_json::to_string(&t.spec.workspace.sources).unwrap_or_else(|_| "[]".into());
-    let mut e = vec![
-        env(
-            "CALIBAND_LISTEN",
-            format!("tcp://0.0.0.0:{}", s.caliband_port),
-        ),
-        env("CALIBAN_WORKSPACE_ROOT", s.workspace_root.clone()),
-        env("CALIBAN_WORKSPACE_SOURCES", sources),
-    ];
+fn caliband_env(t: &CalibanTask, _s: &Settings) -> Vec<EnvVar> {
+    let mut e = vec![];
     if let Some(ep) = t
         .spec
         .state
@@ -151,6 +143,12 @@ pub fn build_sandbox(t: &CalibanTask, s: &Settings) -> Sandbox {
             name: Some("caliband".to_string()),
             ..Default::default()
         }]),
+        args: Some(vec![
+            "--workspace-root".to_string(),
+            s.workspace_root.clone(),
+            "--listen".to_string(),
+            format!("0.0.0.0:{}", s.caliband_port),
+        ]),
         env: Some(caliband_env(t, s)),
         volume_mounts: Some(vec![VolumeMount {
             name: WORKSPACE_VOLUME.to_string(),
@@ -306,12 +304,23 @@ mod tests {
             Some("ghcr.io/caliban-ai/caliban:latest")
         );
         assert_eq!(c.ports.as_ref().unwrap()[0].container_port, 8443);
-        // Env projects the listen addr + workspace root.
+        // Args run caliband as a daemon: --workspace-root <root> --listen 0.0.0.0:<port>.
+        let args = c.args.as_ref().unwrap();
+        let root_idx = args
+            .iter()
+            .position(|a| a == "--workspace-root")
+            .expect("--workspace-root flag present");
+        assert_eq!(args[root_idx + 1], s.workspace_root);
+        let listen_idx = args
+            .iter()
+            .position(|a| a == "--listen")
+            .expect("--listen flag present");
+        assert_eq!(args[listen_idx + 1], "0.0.0.0:8443");
+        // The mismatched env vars from #283 must not reappear.
         let env = c.env.as_ref().unwrap();
-        assert!(env.iter().any(
-            |e| e.name == "CALIBAND_LISTEN" && e.value.as_deref() == Some("tcp://0.0.0.0:8443")
-        ));
-        assert!(env.iter().any(|e| e.name == "CALIBAN_WORKSPACE_ROOT"));
+        assert!(!env.iter().any(|e| e.name == "CALIBAND_LISTEN"));
+        assert!(!env.iter().any(|e| e.name == "CALIBAN_WORKSPACE_ROOT"));
+        assert!(!env.iter().any(|e| e.name == "CALIBAN_WORKSPACE_SOURCES"));
         // No model configured in the default fixture → no router-config env.
         assert!(!env.iter().any(|e| e.name == "CALIBAN_ROUTER_CONFIG_REF"));
         // Workspace PVC present.
