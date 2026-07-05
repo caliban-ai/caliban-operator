@@ -4,5 +4,6 @@
 
 pub mod controller;
 pub mod crd;
+pub mod sandbox;
 
 pub use crd::{CalibanTask, CalibanTaskSpec, CalibanTaskStatus, Phase};
