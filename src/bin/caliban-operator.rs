@@ -6,8 +6,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     tracing::info!("caliban-operator starting");
-    let _client = kube::Client::try_default().await?;
+    let client = kube::Client::try_default().await?;
     tracing::info!("connected to the Kubernetes API");
-    // Controller wiring lands in Task 4.
-    Ok(())
+    caliban_operator::controller::run(client).await
 }
