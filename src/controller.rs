@@ -1,19 +1,23 @@
-//! CalibanTask controller. #282: a no-op reconcile that initializes status to
-//! Pending. The real reconcile (→ agent-sandbox Sandbox + RBAC/NetworkPolicy) is
-//! caliban-ai/caliban#283.
+//! CalibanTask controller (#283): reconciles a `CalibanTask` into its child
+//! objects — a token-less ServiceAccount, a default-deny NetworkPolicy, and the
+//! backing agent-sandbox Sandbox — via server-side apply, then derives and
+//! patches the task's status from the Sandbox's observed state.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
+use k8s_openapi::api::core::v1::ServiceAccount;
+use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::watcher::Config;
 use kube::runtime::Controller;
-use kube::{Api, Client, ResourceExt};
+use kube::{Api, Client, Resource, ResourceExt};
 
 use crate::config::{sandbox_name, Settings};
 use crate::crd::{CalibanTask, CalibanTaskStatus, NamedRef, Phase};
+use crate::resources::plan;
 use crate::sandbox::Sandbox;
 
 /// Controller error.
@@ -31,6 +35,8 @@ pub enum Error {
 pub struct Context {
     /// Kubernetes client.
     pub client: Client,
+    /// Operator settings.
+    pub settings: Settings,
 }
 
 /// Derive the CalibanTask status from the task + its backing Sandbox. Returns
@@ -67,19 +73,44 @@ fn status_eq(a: &CalibanTaskStatus, b: &CalibanTaskStatus) -> bool {
         && a.sandbox_ref.as_ref().map(|r| &r.name) == b.sandbox_ref.as_ref().map(|r| &r.name)
 }
 
+/// Server-side apply `obj` under `name`, force-owned by the operator's field
+/// manager. Used for the operator's own children (SA, NetworkPolicy, Sandbox).
+async fn apply<K>(api: &Api<K>, name: &str, obj: &K) -> Result<(), Error>
+where
+    K: Clone + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + Resource,
+    K::DynamicType: Default,
+{
+    let pp = PatchParams::apply("caliban-operator").force();
+    api.patch(name, &pp, &Patch::Apply(obj)).await?;
+    Ok(())
+}
+
 async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, Error> {
     let ns = obj.namespace().unwrap_or_default();
     let name = obj.name_any();
-    let api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
+    let s = &ctx.settings;
+    let p = plan(&obj, s);
 
-    if let Some(status) = derive_status(&obj, None, &Settings::from_env()) {
+    // Apply children (idempotent SSA; owner refs cascade-delete).
+    let sa_api: Api<ServiceAccount> = Api::namespaced(ctx.client.clone(), &ns);
+    apply(&sa_api, &p.service_account.name_any(), &p.service_account).await?;
+    let np_api: Api<NetworkPolicy> = Api::namespaced(ctx.client.clone(), &ns);
+    apply(&np_api, &p.network_policy.name_any(), &p.network_policy).await?;
+    let sb_api: Api<Sandbox> = Api::namespaced(ctx.client.clone(), &ns);
+    apply(&sb_api, &p.sandbox.name_any(), &p.sandbox).await?;
+
+    // Read the Sandbox back for its status, then derive + patch CalibanTask status.
+    let sandbox = sb_api.get_opt(&sandbox_name(&obj)).await?;
+    if let Some(status) = derive_status(&obj, sandbox.as_ref(), s) {
+        let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
+        let phase = status.phase;
         let patch = serde_json::json!({ "status": status });
-        api.patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+        task_api
+            .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
             .await?;
-        tracing::info!(%ns, %name, "initialized CalibanTask status to Pending");
+        tracing::info!(%ns, %name, ?phase, "patched CalibanTask status");
     }
-    // #282 does nothing else; requeue on a slow cadence.
-    Ok(Action::requeue(Duration::from_secs(300)))
+    Ok(Action::requeue(Duration::from_secs(30)))
 }
 
 fn error_policy(_obj: Arc<CalibanTask>, err: &Error, _ctx: Arc<Context>) -> Action {
@@ -90,7 +121,10 @@ fn error_policy(_obj: Arc<CalibanTask>, err: &Error, _ctx: Arc<Context>) -> Acti
 /// Run the CalibanTask controller until shutdown.
 pub async fn run(client: Client) -> anyhow::Result<()> {
     let tasks: Api<CalibanTask> = Api::all(client.clone());
-    let ctx = Arc::new(Context { client });
+    let ctx = Arc::new(Context {
+        client,
+        settings: Settings::from_env(),
+    });
     Controller::new(tasks, Config::default())
         .run(reconcile, error_policy, ctx)
         .for_each(|res| async move {
