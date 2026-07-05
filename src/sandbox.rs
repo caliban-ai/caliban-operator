@@ -4,7 +4,8 @@
 //! CRD (agent-sandbox owns it), so `Sandbox::crd()` is intentionally unused. See
 //! ADR 0002.
 
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, PodTemplateSpec};
+use k8s_openapi::api::core::v1::{PersistentVolumeClaimSpec, PodTemplateSpec};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,23 @@ pub struct SandboxSpec {
     pub operating_mode: Option<String>,
     /// PVCs materialized for the sandbox (persist across restarts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub volume_claim_templates: Option<Vec<PersistentVolumeClaim>>,
+    pub volume_claim_templates: Option<Vec<VolumeClaimTemplate>>,
+}
+
+/// A `volumeClaimTemplates` entry as agent-sandbox's `Sandbox` schema declares it:
+/// a bare embedded PVC template (`metadata` + `spec`) with **no** `apiVersion`/`kind`.
+///
+/// We must NOT use k8s-openapi's `PersistentVolumeClaim` here: it serializes its
+/// group/version/kind, and agent-sandbox v0.5.0's structural schema rejects those on
+/// server-side apply (`.spec.volumeClaimTemplates[].apiVersion: field not declared in
+/// schema`), which fails every reconcile.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeClaimTemplate {
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<PersistentVolumeClaimSpec>,
 }
 
 /// Observed state of a `Sandbox` (subset the operator reads).
@@ -67,6 +84,36 @@ mod tests {
         assert_eq!(v["spec"]["service"], true);
         assert_eq!(v["spec"]["operatingMode"], "Running");
         assert!(v["spec"]["podTemplate"].is_object());
+    }
+
+    #[test]
+    fn volume_claim_templates_carry_no_type_meta() {
+        // agent-sandbox v0.5.0's Sandbox schema declares only `metadata`/`spec` on
+        // volumeClaimTemplates items; emitting apiVersion/kind fails the SSA with
+        // "field not declared in schema". Guard against regressing to a full PVC.
+        let sb = Sandbox::new(
+            "demo-sbx",
+            SandboxSpec {
+                pod_template: PodTemplateSpec::default(),
+                service: None,
+                operating_mode: None,
+                volume_claim_templates: Some(vec![VolumeClaimTemplate {
+                    metadata: ObjectMeta {
+                        name: Some("workspace".to_string()),
+                        ..Default::default()
+                    },
+                    spec: None,
+                }]),
+            },
+        );
+        let v = serde_json::to_value(&sb).unwrap();
+        let vct = &v["spec"]["volumeClaimTemplates"][0];
+        assert!(
+            vct.get("apiVersion").is_none(),
+            "must not emit apiVersion: {vct}"
+        );
+        assert!(vct.get("kind").is_none(), "must not emit kind: {vct}");
+        assert_eq!(vct["metadata"]["name"], "workspace");
     }
 
     #[test]
