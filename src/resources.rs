@@ -183,6 +183,25 @@ pub fn build_sandbox(t: &CalibanTask, s: &Settings) -> Sandbox {
     sb
 }
 
+/// The child objects a single reconcile applies.
+pub struct ReconcilePlan {
+    /// The task's dedicated, token-less ServiceAccount.
+    pub service_account: ServiceAccount,
+    /// The default-deny NetworkPolicy scoping the sandbox pod's traffic.
+    pub network_policy: NetworkPolicy,
+    /// The backing agent-sandbox Sandbox.
+    pub sandbox: Sandbox,
+}
+
+/// Assemble every child object for a task (pure).
+pub fn plan(t: &CalibanTask, s: &Settings) -> ReconcilePlan {
+    ReconcilePlan {
+        service_account: build_service_account(t),
+        network_policy: build_network_policy(t, s),
+        sandbox: build_sandbox(t, s),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +335,23 @@ mod tests {
                 .runtime_class_name
                 .as_deref(),
             Some("gvisor")
+        );
+    }
+
+    #[test]
+    fn plan_names_all_three_children() {
+        let p = plan(&task(), &Settings::default());
+        assert_eq!(
+            p.service_account.metadata.name.as_deref(),
+            Some("refactor-auth-sa")
+        );
+        assert_eq!(
+            p.network_policy.metadata.name.as_deref(),
+            Some("refactor-auth-netpol")
+        );
+        assert_eq!(
+            p.sandbox.metadata.name.as_deref(),
+            Some("refactor-auth-sbx")
         );
     }
 }
