@@ -1,0 +1,16 @@
+# Build artifacts and VCS — never needed in the image context.
+target/
+.git/
+.github/
+.claude/
+
+# Docs / metadata not needed to build the binary.
+docs/
+*.md
+CODEOWNERS
+
+# Editor / OS junk.
+Cargo.lock.bak
+*.swp
+*.rs.bk
+.DS_Store
