@@ -89,7 +89,7 @@ fn env(name: &str, value: String) -> EnvVar {
     }
 }
 
-fn caliband_env(t: &CalibanTask, _s: &Settings) -> Vec<EnvVar> {
+fn caliband_env(t: &CalibanTask) -> Vec<EnvVar> {
     let mut e = vec![];
     if let Some(ep) = t
         .spec
@@ -108,6 +108,43 @@ fn caliband_env(t: &CalibanTask, _s: &Settings) -> Vec<EnvVar> {
         e.push(env("CALIBAN_ROUTER_CONFIG_REF", r));
     }
     e
+}
+
+/// Build the idempotent clone script for the init container: for each workspace
+/// source, clone `repo` at `ref` into `path` unless it's already a git checkout
+/// (so pause/resume and pod restarts over the persistent PVC don't refetch).
+fn clone_script(t: &CalibanTask) -> String {
+    let mut s = String::from("set -eu\n");
+    for src in &t.spec.workspace.sources {
+        s.push_str(&format!(
+            "if [ ! -d '{path}/.git' ]; then git clone --depth 1 --branch '{r}' '{repo}' '{path}'; fi\n",
+            path = src.path, r = src.r#ref, repo = src.repo,
+        ));
+    }
+    s
+}
+
+/// The git-clone init container that populates the workspace volume from
+/// `spec.workspace.sources[]`, if any are configured.
+fn clone_init_container(t: &CalibanTask, s: &Settings) -> Option<Container> {
+    if t.spec.workspace.sources.is_empty() {
+        return None;
+    }
+    Some(Container {
+        name: "clone-workspace".to_string(),
+        image: Some(s.git_image.clone()),
+        command: Some(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            clone_script(t),
+        ]),
+        volume_mounts: Some(vec![VolumeMount {
+            name: WORKSPACE_VOLUME.to_string(),
+            mount_path: s.workspace_root.clone(),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    })
 }
 
 fn workspace_pvc(s: &Settings) -> PersistentVolumeClaim {
@@ -149,7 +186,7 @@ pub fn build_sandbox(t: &CalibanTask, s: &Settings) -> Sandbox {
             "--listen".to_string(),
             format!("0.0.0.0:{}", s.caliband_port),
         ]),
-        env: Some(caliband_env(t, s)),
+        env: Some(caliband_env(t)),
         volume_mounts: Some(vec![VolumeMount {
             name: WORKSPACE_VOLUME.to_string(),
             mount_path: s.workspace_root.clone(),
@@ -159,6 +196,7 @@ pub fn build_sandbox(t: &CalibanTask, s: &Settings) -> Sandbox {
     };
     let pod_spec = PodSpec {
         containers: vec![container],
+        init_containers: clone_init_container(t, s).map(|c| vec![c]),
         runtime_class_name: t
             .spec
             .isolation
@@ -335,6 +373,42 @@ mod tests {
             .labels
             .unwrap()
             .contains_key("caliban.caliban-ai.dev/task"));
+    }
+
+    #[test]
+    fn sandbox_has_git_clone_init_container_for_workspace_sources() {
+        let s = Settings::default();
+        let sb = build_sandbox(&task(), &s);
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let inits = pod.init_containers.expect("init containers present");
+        assert_eq!(inits.len(), 1);
+        let init = &inits[0];
+        assert_eq!(init.name, "clone-workspace");
+        assert_eq!(
+            init.image.as_deref(),
+            Some(Settings::default().git_image.as_str())
+        );
+        let mounts = init.volume_mounts.as_ref().unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].name, "workspace");
+        assert_eq!(mounts[0].mount_path, s.workspace_root);
+        let command = init.command.as_ref().unwrap();
+        assert_eq!(command[0], "/bin/sh");
+        assert_eq!(command[1], "-c");
+        let script = &command[2];
+        assert!(
+            script.contains("git clone --depth 1 --branch 'main' 'git@x:caliban' '/work/caliban'")
+        );
+        assert!(script.contains("[ ! -d '/work/caliban/.git' ]"));
+    }
+
+    #[test]
+    fn sandbox_omits_init_containers_when_no_workspace_sources() {
+        let mut t = task();
+        t.spec.workspace.sources = vec![];
+        let sb = build_sandbox(&t, &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        assert!(pod.init_containers.is_none());
     }
 
     #[test]
