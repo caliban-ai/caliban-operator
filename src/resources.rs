@@ -110,8 +110,7 @@ fn caliband_env(t: &CalibanTask, s: &Settings) -> Vec<EnvVar> {
     e
 }
 
-fn workspace_pvc(t: &CalibanTask, s: &Settings) -> PersistentVolumeClaim {
-    let _ = t;
+fn workspace_pvc(s: &Settings) -> PersistentVolumeClaim {
     PersistentVolumeClaim {
         metadata: ObjectMeta {
             name: Some(WORKSPACE_VOLUME.to_string()),
@@ -175,7 +174,7 @@ pub fn build_sandbox(t: &CalibanTask, s: &Settings) -> Sandbox {
             },
             service: Some(true),
             operating_mode: Some("Running".to_string()),
-            volume_claim_templates: Some(vec![workspace_pvc(t, s)]),
+            volume_claim_templates: Some(vec![workspace_pvc(s)]),
         },
     );
     sb.metadata.namespace = t.namespace();
