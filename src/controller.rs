@@ -52,11 +52,9 @@ pub(crate) fn derive_status(
     let mut next = t.status.clone().unwrap_or_default();
     next.phase = phase;
     next.caliband_endpoint = endpoint;
-    if sandbox.is_some() {
-        next.sandbox_ref = Some(NamedRef {
-            name: sandbox_name(t),
-        });
-    }
+    next.sandbox_ref = sandbox.map(|_| NamedRef {
+        name: sandbox_name(t),
+    });
     match &t.status {
         Some(cur) if status_eq(cur, &next) => None,
         _ => Some(next),
@@ -195,5 +193,19 @@ mod tests {
         // First derivation, then apply it as the observed status.
         t.status = super::derive_status(&t, Some(&sb), &Settings::default());
         assert!(super::derive_status(&t, Some(&sb), &Settings::default()).is_none());
+    }
+
+    #[test]
+    fn sandbox_disappearing_clears_ref_and_returns_to_pending() {
+        let mut t = task_without_status();
+        let sb = sandbox_with_fqdn(Some("refactor-auth-sbx.team-a.svc"));
+        // Observed status reflects a running sandbox...
+        t.status = super::derive_status(&t, Some(&sb), &Settings::default());
+        assert!(t.status.as_ref().unwrap().sandbox_ref.is_some());
+        // ...then the sandbox is gone: status must return to Pending with no ref.
+        let d = super::derive_status(&t, None, &Settings::default()).unwrap();
+        assert_eq!(d.phase, Phase::Pending);
+        assert!(d.sandbox_ref.is_none());
+        assert!(d.caliband_endpoint.is_none());
     }
 }
