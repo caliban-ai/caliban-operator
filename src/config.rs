@@ -19,6 +19,8 @@ pub struct Settings {
     pub workspace_root: String,
     /// Requested size of the workspace PVC (e.g. `10Gi`).
     pub workspace_storage: String,
+    /// Container image for the git-clone init container that populates the workspace.
+    pub git_image: String,
 }
 
 impl Default for Settings {
@@ -28,13 +30,14 @@ impl Default for Settings {
             caliband_port: 8443,
             workspace_root: "/work".to_string(),
             workspace_storage: "10Gi".to_string(),
+            git_image: "alpine/git:latest".to_string(),
         }
     }
 }
 
 impl Settings {
     /// Read settings from `CALIBAND_IMAGE`, `CALIBAND_PORT`, `CALIBAN_WORKSPACE_ROOT`,
-    /// `CALIBAN_WORKSPACE_STORAGE`, falling back to defaults.
+    /// `CALIBAN_WORKSPACE_STORAGE`, `CALIBAN_GIT_IMAGE`, falling back to defaults.
     pub fn from_env() -> Self {
         let d = Self::default();
         Self {
@@ -46,6 +49,7 @@ impl Settings {
             workspace_root: std::env::var("CALIBAN_WORKSPACE_ROOT").unwrap_or(d.workspace_root),
             workspace_storage: std::env::var("CALIBAN_WORKSPACE_STORAGE")
                 .unwrap_or(d.workspace_storage),
+            git_image: std::env::var("CALIBAN_GIT_IMAGE").unwrap_or(d.git_image),
         }
     }
 }
@@ -144,5 +148,7 @@ mod tests {
         assert_eq!(s.caliband_port, 8443);
         assert!(!s.caliband_image.contains("home"));
         assert_eq!(s.workspace_root, "/work");
+        assert!(!s.git_image.contains("home"));
+        assert!(!s.git_image.is_empty());
     }
 }

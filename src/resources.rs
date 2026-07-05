@@ -89,16 +89,8 @@ fn env(name: &str, value: String) -> EnvVar {
     }
 }
 
-fn caliband_env(t: &CalibanTask, s: &Settings) -> Vec<EnvVar> {
-    let sources = serde_json::to_string(&t.spec.workspace.sources).unwrap_or_else(|_| "[]".into());
-    let mut e = vec![
-        env(
-            "CALIBAND_LISTEN",
-            format!("tcp://0.0.0.0:{}", s.caliband_port),
-        ),
-        env("CALIBAN_WORKSPACE_ROOT", s.workspace_root.clone()),
-        env("CALIBAN_WORKSPACE_SOURCES", sources),
-    ];
+fn caliband_env(t: &CalibanTask) -> Vec<EnvVar> {
+    let mut e = vec![];
     if let Some(ep) = t
         .spec
         .state
@@ -116,6 +108,51 @@ fn caliband_env(t: &CalibanTask, s: &Settings) -> Vec<EnvVar> {
         e.push(env("CALIBAN_ROUTER_CONFIG_REF", r));
     }
     e
+}
+
+/// POSIX single-quote a value for safe interpolation into `/bin/sh -c`.
+fn sh_squote(v: &str) -> String {
+    format!("'{}'", v.replace('\'', "'\\''"))
+}
+
+/// Build the idempotent clone script for the init container: for each workspace
+/// source, clone `repo` at `ref` into `path` unless it's already a git checkout
+/// (so pause/resume and pod restarts over the persistent PVC don't refetch).
+fn clone_script(t: &CalibanTask) -> String {
+    let mut s = String::from("set -eu\n");
+    for src in &t.spec.workspace.sources {
+        s.push_str(&format!(
+            "if [ ! -d {git} ]; then git clone --depth 1 --branch {r} {repo} {path}; fi\n",
+            git = sh_squote(&format!("{}/.git", src.path)),
+            r = sh_squote(&src.r#ref),
+            repo = sh_squote(&src.repo),
+            path = sh_squote(&src.path),
+        ));
+    }
+    s
+}
+
+/// The git-clone init container that populates the workspace volume from
+/// `spec.workspace.sources[]`, if any are configured.
+fn clone_init_container(t: &CalibanTask, s: &Settings) -> Option<Container> {
+    if t.spec.workspace.sources.is_empty() {
+        return None;
+    }
+    Some(Container {
+        name: "clone-workspace".to_string(),
+        image: Some(s.git_image.clone()),
+        command: Some(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            clone_script(t),
+        ]),
+        volume_mounts: Some(vec![VolumeMount {
+            name: WORKSPACE_VOLUME.to_string(),
+            mount_path: s.workspace_root.clone(),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    })
 }
 
 fn workspace_pvc(s: &Settings) -> PersistentVolumeClaim {
@@ -151,7 +188,13 @@ pub fn build_sandbox(t: &CalibanTask, s: &Settings) -> Sandbox {
             name: Some("caliband".to_string()),
             ..Default::default()
         }]),
-        env: Some(caliband_env(t, s)),
+        args: Some(vec![
+            "--workspace-root".to_string(),
+            s.workspace_root.clone(),
+            "--listen".to_string(),
+            format!("0.0.0.0:{}", s.caliband_port),
+        ]),
+        env: Some(caliband_env(t)),
         volume_mounts: Some(vec![VolumeMount {
             name: WORKSPACE_VOLUME.to_string(),
             mount_path: s.workspace_root.clone(),
@@ -161,6 +204,7 @@ pub fn build_sandbox(t: &CalibanTask, s: &Settings) -> Sandbox {
     };
     let pod_spec = PodSpec {
         containers: vec![container],
+        init_containers: clone_init_container(t, s).map(|c| vec![c]),
         runtime_class_name: t
             .spec
             .isolation
@@ -306,12 +350,23 @@ mod tests {
             Some("ghcr.io/caliban-ai/caliban:latest")
         );
         assert_eq!(c.ports.as_ref().unwrap()[0].container_port, 8443);
-        // Env projects the listen addr + workspace root.
+        // Args run caliband as a daemon: --workspace-root <root> --listen 0.0.0.0:<port>.
+        let args = c.args.as_ref().unwrap();
+        let root_idx = args
+            .iter()
+            .position(|a| a == "--workspace-root")
+            .expect("--workspace-root flag present");
+        assert_eq!(args[root_idx + 1], s.workspace_root);
+        let listen_idx = args
+            .iter()
+            .position(|a| a == "--listen")
+            .expect("--listen flag present");
+        assert_eq!(args[listen_idx + 1], "0.0.0.0:8443");
+        // The mismatched env vars from #283 must not reappear.
         let env = c.env.as_ref().unwrap();
-        assert!(env.iter().any(
-            |e| e.name == "CALIBAND_LISTEN" && e.value.as_deref() == Some("tcp://0.0.0.0:8443")
-        ));
-        assert!(env.iter().any(|e| e.name == "CALIBAN_WORKSPACE_ROOT"));
+        assert!(!env.iter().any(|e| e.name == "CALIBAND_LISTEN"));
+        assert!(!env.iter().any(|e| e.name == "CALIBAN_WORKSPACE_ROOT"));
+        assert!(!env.iter().any(|e| e.name == "CALIBAN_WORKSPACE_SOURCES"));
         // No model configured in the default fixture → no router-config env.
         assert!(!env.iter().any(|e| e.name == "CALIBAN_ROUTER_CONFIG_REF"));
         // Workspace PVC present.
@@ -326,6 +381,54 @@ mod tests {
             .labels
             .unwrap()
             .contains_key("caliban.caliban-ai.dev/task"));
+    }
+
+    #[test]
+    fn sandbox_has_git_clone_init_container_for_workspace_sources() {
+        let s = Settings::default();
+        let sb = build_sandbox(&task(), &s);
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let inits = pod.init_containers.expect("init containers present");
+        assert_eq!(inits.len(), 1);
+        let init = &inits[0];
+        assert_eq!(init.name, "clone-workspace");
+        assert_eq!(
+            init.image.as_deref(),
+            Some(Settings::default().git_image.as_str())
+        );
+        let mounts = init.volume_mounts.as_ref().unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].name, "workspace");
+        assert_eq!(mounts[0].mount_path, s.workspace_root);
+        let command = init.command.as_ref().unwrap();
+        assert_eq!(command[0], "/bin/sh");
+        assert_eq!(command[1], "-c");
+        let script = &command[2];
+        assert!(
+            script.contains("git clone --depth 1 --branch 'main' 'git@x:caliban' '/work/caliban'")
+        );
+        assert!(script.contains("[ ! -d '/work/caliban/.git' ]"));
+    }
+
+    #[test]
+    fn clone_script_shell_escapes_source_values() {
+        let mut t = task();
+        t.spec.workspace.sources[0].repo = "https://x/a'b".into();
+        let sb = build_sandbox(&t, &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let init = &pod.init_containers.unwrap()[0];
+        let script = &init.command.as_ref().unwrap()[2];
+        assert!(script.contains("'https://x/a'\\''b'"));
+        assert!(!script.contains("'https://x/a'b'"));
+    }
+
+    #[test]
+    fn sandbox_omits_init_containers_when_no_workspace_sources() {
+        let mut t = task();
+        t.spec.workspace.sources = vec![];
+        let sb = build_sandbox(&t, &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        assert!(pod.init_containers.is_none());
     }
 
     #[test]
