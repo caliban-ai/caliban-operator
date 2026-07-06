@@ -45,6 +45,7 @@ pub struct CalibanTaskSpec {
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
     /// The guaranteed source checkouts (runtime-extensible).
+    #[schemars(length(min = 1))]
     pub sources: Vec<Source>,
     /// Optional in-pod aux services (e.g. gonzalod, prosperod) for e2e.
     #[serde(default)]
@@ -56,13 +57,16 @@ pub struct Workspace {
 #[serde(rename_all = "camelCase")]
 pub struct Source {
     /// Source identifier (matches caliband's workspace source name).
+    #[schemars(length(min = 1))]
     pub name: String,
     /// Git remote to clone.
+    #[schemars(length(min = 1))]
     pub repo: String,
     /// Git ref to check out. Defaults to `main`.
     #[serde(default = "default_ref")]
     pub r#ref: String,
     /// Absolute mount path in the pod (e.g. `/work/caliban`).
+    #[schemars(length(min = 1))]
     pub path: String,
 }
 
@@ -75,6 +79,7 @@ fn default_ref() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct TaskSpec {
     /// Initial prompt.
+    #[schemars(length(min = 1))]
     pub prompt: String,
     /// Agent type (e.g. `general-purpose`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,7 +253,7 @@ spec:
 
     #[test]
     fn sample_cr_round_trips() {
-        let task: CalibanTask = serde_yaml::from_str(SAMPLE).expect("deserialize sample");
+        let task: CalibanTask = serde_norway::from_str(SAMPLE).expect("deserialize sample");
         assert_eq!(task.spec.workspace.sources.len(), 2);
         assert_eq!(task.spec.workspace.sources[0].name, "caliban");
         assert_eq!(task.spec.workspace.sources[1].r#ref, "feat-xport");
@@ -297,12 +302,40 @@ spec:
 
     #[test]
     fn committed_crd_yaml_is_in_sync() {
-        let generated = serde_yaml::to_string(&CalibanTask::crd()).unwrap();
+        let generated = serde_norway::to_string(&CalibanTask::crd()).unwrap();
         let committed = include_str!("../deploy/crd/calibantask.yaml");
         assert_eq!(
             generated.trim(),
             committed.trim(),
             "deploy/crd/calibantask.yaml is stale — regenerate: cargo run --bin crdgen > deploy/crd/calibantask.yaml"
+        );
+    }
+
+    #[test]
+    fn crd_enforces_non_empty_required_fields() {
+        // Semantically-invalid CRs (`sources: []`, `prompt: ""`) must be rejected
+        // by the API server, not admitted and set to Pending. The generated CRD
+        // schema carries the constraints (schemars `length(min = 1)`).
+        let crd = CalibanTask::crd();
+        let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
+        let spec = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"];
+
+        // sources: at least one checkout.
+        assert_eq!(
+            spec["workspace"]["properties"]["sources"]["minItems"], 1,
+            "workspace.sources must require minItems: 1"
+        );
+        // Required strings: no empty values.
+        let source_props = &spec["workspace"]["properties"]["sources"]["items"]["properties"];
+        for field in ["name", "repo", "path"] {
+            assert_eq!(
+                source_props[field]["minLength"], 1,
+                "source.{field} must require minLength: 1"
+            );
+        }
+        assert_eq!(
+            spec["task"]["properties"]["prompt"]["minLength"], 1,
+            "task.prompt must require minLength: 1"
         );
     }
 
@@ -317,7 +350,7 @@ spec:
   workspace: { sources: [ { name: only, repo: "git@x:only", path: /work/only } ] }
   task: { prompt: hi }
 "#;
-        let task: CalibanTask = serde_yaml::from_str(yaml).unwrap();
+        let task: CalibanTask = serde_norway::from_str(yaml).unwrap();
         assert_eq!(task.spec.workspace.sources[0].r#ref, "main"); // default ref
         assert!(task.spec.workspace.services.is_empty());
         assert!(task.spec.model.is_none());

@@ -126,6 +126,9 @@ pub async fn run(client: Client) -> anyhow::Result<()> {
         settings: Settings::from_env(),
     });
     Controller::new(tasks, Config::default())
+        // Drain in-flight reconciles on SIGTERM/SIGINT (pod termination, Ctrl+C)
+        // instead of hard-killing mid-reconcile.
+        .shutdown_on_signal()
         .run(reconcile, error_policy, ctx)
         .for_each(|res| async move {
             match res {
