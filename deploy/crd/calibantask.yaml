@@ -94,6 +94,7 @@ spec:
                     type: string
                   prompt:
                     description: Initial prompt.
+                    minLength: 1
                     type: string
                 required:
                 - prompt
@@ -114,9 +115,11 @@ spec:
                       properties:
                         name:
                           description: Source identifier (matches caliband's workspace source name).
+                          minLength: 1
                           type: string
                         path:
                           description: Absolute mount path in the pod (e.g. `/work/caliban`).
+                          minLength: 1
                           type: string
                         ref:
                           default: main
@@ -124,12 +127,14 @@ spec:
                           type: string
                         repo:
                           description: Git remote to clone.
+                          minLength: 1
                           type: string
                       required:
                       - name
                       - path
                       - repo
                       type: object
+                    minItems: 1
                     type: array
                 required:
                 - sources

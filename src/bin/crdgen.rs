@@ -4,6 +4,6 @@ use kube::CustomResourceExt;
 
 fn main() -> anyhow::Result<()> {
     let crd = caliban_operator::crd::CalibanTask::crd();
-    print!("{}", serde_yaml::to_string(&crd)?);
+    print!("{}", serde_norway::to_string(&crd)?);
     Ok(())
 }
