@@ -55,7 +55,7 @@ pub struct Provider {
     /// Provider kind (e.g. `ollama`, `anthropic`, `openai`).
     #[schemars(length(min = 1))]
     pub kind: String,
-    /// Override base URL (e.g. `http://192.168.1.240:11434`).
+    /// Override base URL (e.g. `http://ollama.example.com:11434`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     /// Default model for this provider.
@@ -382,7 +382,7 @@ spec:
     - { name: caliban, repo: "git@example:caliban", ref: main, path: /work/caliban }
   providers:
     - { name: planner, kind: anthropic, model: claude-opus-4-8, credentialsRef: { secretName: anthropic-key, key: api-key } }
-    - { name: workers, kind: ollama, baseUrl: "http://192.168.1.240:11434", model: qwen2.5-coder }
+    - { name: workers, kind: ollama, baseUrl: "http://ollama.example.com:11434", model: qwen2.5-coder }
   defaultProvider: planner
 "#;
         let ws: Workspace = serde_norway::from_str(yaml).unwrap();
