@@ -169,9 +169,6 @@ pub struct CalibanTaskStatus {
     /// Latest checkpoint reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_ref: Option<String>,
-    /// Observed workspace (incl. runtime-added sources).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<WorkspaceStatus>,
     /// Standard Kubernetes conditions.
     // No `skip_serializing_if` here either (see `caliband_endpoint` above):
     // `derive_status` sets this to `[]` to clear a stale `Ready` condition
@@ -195,15 +192,6 @@ pub struct CalibanTaskStatus {
 pub struct NamedRef {
     /// Object name.
     pub name: String,
-}
-
-/// Observed workspace state.
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceStatus {
-    /// Source names observed materialized in the pod.
-    #[serde(default)]
-    pub materialized: Vec<String>,
 }
 
 /// A minimal Kubernetes-style condition.

@@ -287,17 +287,6 @@ spec:
                 required:
                 - name
                 type: object
-              workspace:
-                description: Observed workspace (incl. runtime-added sources).
-                nullable: true
-                properties:
-                  materialized:
-                    default: []
-                    description: Source names observed materialized in the pod.
-                    items:
-                      type: string
-                    type: array
-                type: object
             type: object
         required:
         - spec
