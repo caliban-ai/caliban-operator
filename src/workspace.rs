@@ -1,0 +1,201 @@
+//! The `Workspace` custom resource (v1alpha1): durable, shared config — sources,
+//! named providers (each with its own model + Secret reference), env, isolation —
+//! that `CalibanTask`s reference by name. Owned and reconciled by the operator,
+//! which is the sole reader of provider credential Secrets. See ADR 0004 and the
+//! Prospero K8s Config Plane design.
+
+use kube::CustomResource;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::crd::{Condition, IsolationSpec, Source};
+
+/// Desired state of a workspace: sources + named providers + defaults.
+#[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[kube(
+    group = "caliban.caliban-ai.dev",
+    version = "v1alpha1",
+    kind = "Workspace",
+    namespaced,
+    status = "WorkspaceStatus",
+    shortname = "cws",
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
+)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSpec {
+    /// Human-friendly dashboard label.
+    #[schemars(length(min = 1))]
+    pub display_name: String,
+    /// The workspace's git checkouts (1..N).
+    #[schemars(length(min = 1))]
+    pub sources: Vec<Source>,
+    /// Named providers (1..N) agents in this workspace can bind to.
+    #[schemars(length(min = 1))]
+    pub providers: Vec<Provider>,
+    /// Provider name agents get when they don't request one. Implicit when
+    /// exactly one provider is defined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
+    /// Non-secret environment injected into every agent pod.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<EnvEntry>,
+    /// Default isolation for agents launched against this workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<IsolationSpec>,
+}
+
+/// A named model provider bound within a workspace.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Provider {
+    /// Provider identifier, unique within the workspace (e.g. `planner`).
+    #[schemars(length(min = 1))]
+    pub name: String,
+    /// Provider kind (e.g. `ollama`, `anthropic`, `openai`).
+    #[schemars(length(min = 1))]
+    pub kind: String,
+    /// Override base URL (e.g. `http://192.168.1.240:11434`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Default model for this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reference to an existing Secret for this provider's API key. Keyless
+    /// providers (e.g. ollama) omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_ref: Option<CredentialsRef>,
+}
+
+/// A by-name reference to a key within an existing Kubernetes Secret.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsRef {
+    /// Name of the Secret (same namespace).
+    #[schemars(length(min = 1))]
+    pub secret_name: String,
+    /// Key within the Secret's data.
+    #[schemars(length(min = 1))]
+    pub key: String,
+}
+
+/// A non-secret environment entry.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvEntry {
+    /// Variable name.
+    #[schemars(length(min = 1))]
+    pub name: String,
+    /// Variable value.
+    pub value: String,
+}
+
+/// Observed state of a `Workspace`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceStatus {
+    /// Lifecycle phase.
+    #[serde(default)]
+    pub phase: WorkspacePhase,
+    /// Standard Kubernetes conditions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
+    /// The `.metadata.generation` this status reflects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<i64>,
+    /// Human-readable detail (e.g. `provider 'planner': secret 'anthropic-key' not found`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// `Workspace` lifecycle phase.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema)]
+pub enum WorkspacePhase {
+    /// Created, not yet reconciled.
+    #[default]
+    Pending,
+    /// Reconcile in progress.
+    Reconciling,
+    /// Valid — all providers and credential Secrets resolve.
+    Ready,
+    /// Invalid — see `message`.
+    Failed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kube::CustomResourceExt;
+
+    #[test]
+    fn crd_has_correct_group_version_kind() {
+        let crd = Workspace::crd();
+        assert_eq!(crd.spec.group, "caliban.caliban-ai.dev");
+        assert_eq!(crd.spec.names.kind, "Workspace");
+        assert_eq!(crd.spec.versions[0].name, "v1alpha1");
+        assert_eq!(crd.spec.scope, "Namespaced");
+        assert!(crd.spec.versions[0]
+            .subresources
+            .as_ref()
+            .unwrap()
+            .status
+            .is_some());
+    }
+
+    #[test]
+    fn crd_enforces_non_empty_required_fields() {
+        let crd = Workspace::crd();
+        let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
+        let spec = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"];
+        assert_eq!(spec["sources"]["minItems"], 1);
+        assert_eq!(spec["providers"]["minItems"], 1);
+        assert_eq!(spec["displayName"]["minLength"], 1);
+        let prov = &spec["providers"]["items"]["properties"];
+        assert_eq!(prov["name"]["minLength"], 1);
+        assert_eq!(prov["kind"]["minLength"], 1);
+    }
+
+    #[test]
+    fn sample_cr_round_trips() {
+        let yaml = r#"
+apiVersion: caliban.caliban-ai.dev/v1alpha1
+kind: Workspace
+metadata: { name: team-a-ws, namespace: team-a }
+spec:
+  displayName: Team A
+  sources:
+    - { name: caliban, repo: "git@example:caliban", ref: main, path: /work/caliban }
+  providers:
+    - { name: planner, kind: anthropic, model: claude-opus-4-8, credentialsRef: { secretName: anthropic-key, key: api-key } }
+    - { name: workers, kind: ollama, baseUrl: "http://192.168.1.240:11434", model: qwen2.5-coder }
+  defaultProvider: planner
+"#;
+        let ws: Workspace = serde_norway::from_str(yaml).unwrap();
+        assert_eq!(ws.spec.providers.len(), 2);
+        assert_eq!(ws.spec.providers[0].name, "planner");
+        assert_eq!(
+            ws.spec.providers[0]
+                .credentials_ref
+                .as_ref()
+                .unwrap()
+                .secret_name,
+            "anthropic-key"
+        );
+        assert!(ws.spec.providers[1].credentials_ref.is_none());
+        assert_eq!(ws.spec.default_provider.as_deref(), Some("planner"));
+        // camelCase survives round-trip.
+        let v = serde_json::to_value(&ws.spec).unwrap();
+        assert!(v["displayName"].is_string());
+    }
+
+    #[test]
+    fn committed_crd_yaml_is_in_sync() {
+        let generated = serde_norway::to_string(&Workspace::crd()).unwrap();
+        let committed = include_str!("../deploy/crd/workspace.yaml");
+        assert_eq!(
+            generated.trim(),
+            committed.trim(),
+            "deploy/crd/workspace.yaml is stale — regenerate: cargo run --bin crdgen workspace > deploy/crd/workspace.yaml"
+        );
+    }
+}
