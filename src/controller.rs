@@ -103,6 +103,53 @@ where
     Ok(())
 }
 
+/// Admission decision for a `CalibanTask` against its referenced `Workspace`,
+/// evaluated once before pinning. Pure — cluster I/O (the `Workspace` fetch and
+/// the status patch) is the caller's job.
+pub(crate) enum Admission {
+    /// The workspace is `Ready` and resolves cleanly: pin this config.
+    Pin(Box<crate::workspace::ResolvedWorkspace>),
+    /// The workspace exists but isn't `Ready` yet (still `Pending`): don't pin,
+    /// requeue and re-check once its own controller has validated it.
+    Requeue,
+    /// Terminal task-config error — missing workspace, a `Failed` workspace, or
+    /// an unresolvable `providerRef`. The string is the human-readable reason.
+    Fail(String),
+}
+
+/// Decide whether a `CalibanTask` may pin its `workspaceRef`/`providerRef`.
+/// Gates on the referenced `Workspace`'s readiness so a task never launches a
+/// doomed pod against a `Failed` workspace (e.g. a missing credential Secret)
+/// nor pins against a not-yet-validated one.
+pub(crate) fn admit(
+    ws: Option<&Workspace>,
+    provider_ref: Option<&str>,
+    workspace_ref_name: &str,
+) -> Admission {
+    let Some(w) = ws else {
+        return Admission::Fail(format!("Workspace not found: '{workspace_ref_name}'"));
+    };
+    let phase = w.status.as_ref().map(|s| s.phase).unwrap_or_default();
+    match phase {
+        crate::workspace::WorkspacePhase::Failed => {
+            let detail = w
+                .status
+                .as_ref()
+                .and_then(|s| s.message.clone())
+                .unwrap_or_else(|| "validation failed".to_string());
+            Admission::Fail(format!(
+                "workspace '{workspace_ref_name}' not ready: {detail}"
+            ))
+        }
+        crate::workspace::WorkspacePhase::Ready => match resolve_workspace(&w.spec, provider_ref) {
+            Ok(rw) => Admission::Pin(Box::new(rw)),
+            Err(reason) => Admission::Fail(reason),
+        },
+        // Pending: the Workspace controller hasn't validated it yet. Wait.
+        crate::workspace::WorkspacePhase::Pending => Admission::Requeue,
+    }
+}
+
 async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, Error> {
     let ns = obj.namespace().unwrap_or_default();
     let name = obj.name_any();
@@ -119,20 +166,19 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
         None => {
             let ws_api: Api<Workspace> = Api::namespaced(ctx.client.clone(), &ns);
             let ws = ws_api.get_opt(&obj.spec.workspace_ref.name).await?;
-            // Distinguish "no such Workspace" from a `resolve_workspace` failure
-            // (dangling providerRef, ambiguous default, ...) so the specific
-            // reason makes it into the condition's human-readable `message`
-            // instead of collapsing every unresolved case into one generic
-            // string. `reason` stays the fixed `WorkspaceUnresolved`.
-            let resolution: Result<crate::workspace::ResolvedWorkspace, String> = match ws {
-                Some(w) => resolve_workspace(&w.spec, obj.spec.provider_ref.as_deref()),
-                None => Err(format!(
-                    "Workspace not found: '{}'",
-                    obj.spec.workspace_ref.name
-                )),
-            };
-            match resolution {
-                Ok(rw) => {
+            // Gate on the referenced Workspace's readiness before pinning, so a
+            // task never launches a doomed pod against a Failed workspace nor
+            // pins a not-yet-validated one. `admit` also distinguishes "no such
+            // Workspace" and a dangling `providerRef` so the specific reason
+            // reaches the condition's human-readable `message` (reason stays the
+            // fixed `WorkspaceUnresolved`).
+            match admit(
+                ws.as_ref(),
+                obj.spec.provider_ref.as_deref(),
+                &obj.spec.workspace_ref.name,
+            ) {
+                Admission::Pin(rw) => {
+                    let rw = *rw;
                     // Persist the pin immediately so it's stable for the run.
                     // Any stale `WorkspaceUnresolved` condition left by a prior
                     // fail-fast reconcile is cleared once `derive_status` runs
@@ -148,7 +194,13 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
                         .await?;
                     rw
                 }
-                Err(reason) => {
+                Admission::Requeue => {
+                    // Workspace exists but isn't Ready yet; don't pin. Its own
+                    // controller will validate it shortly — re-check soon.
+                    tracing::info!(%ns, %name, "workspace not ready; deferring pin");
+                    return Ok(Action::requeue(Duration::from_secs(10)));
+                }
+                Admission::Fail(reason) => {
                     let patch = serde_json::json!({
                         "status": { "phase": Phase::Failed,
                             "conditions": [{ "type": "Ready", "status": "False",
@@ -219,9 +271,93 @@ pub async fn run(client: Client) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{CalibanTaskSpec, TaskSpec, WorkspaceRef};
+    use crate::crd::{CalibanTaskSpec, Source, TaskSpec, WorkspaceRef};
     use crate::sandbox::{SandboxSpec, SandboxStatus};
+    use crate::workspace::{Provider, Workspace, WorkspacePhase, WorkspaceSpec, WorkspaceStatus};
     use k8s_openapi::api::core::v1::PodTemplateSpec;
+
+    fn workspace(phase: WorkspacePhase, message: Option<&str>) -> Workspace {
+        let mut ws = Workspace::new(
+            "team-a-ws",
+            WorkspaceSpec {
+                display_name: "Team A".into(),
+                sources: vec![Source {
+                    name: "caliban".into(),
+                    repo: "git@x:caliban".into(),
+                    r#ref: "main".into(),
+                    path: "/work/caliban".into(),
+                }],
+                providers: vec![Provider {
+                    name: "workers".into(),
+                    kind: "ollama".into(),
+                    base_url: None,
+                    model: None,
+                    credentials_ref: None,
+                }],
+                default_provider: None,
+                env: vec![],
+                isolation: None,
+            },
+        );
+        ws.status = Some(WorkspaceStatus {
+            phase,
+            message: message.map(String::from),
+            ..Default::default()
+        });
+        ws
+    }
+
+    #[test]
+    fn admit_pins_a_ready_workspace() {
+        let ws = workspace(WorkspacePhase::Ready, None);
+        match admit(Some(&ws), None, "team-a-ws") {
+            Admission::Pin(rw) => assert_eq!(rw.provider.name, "workers"),
+            other => panic!("expected Pin, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn admit_requeues_a_pending_workspace() {
+        let ws = workspace(WorkspacePhase::Pending, None);
+        assert!(matches!(
+            admit(Some(&ws), None, "team-a-ws"),
+            Admission::Requeue
+        ));
+    }
+
+    #[test]
+    fn admit_fails_a_failed_workspace_and_surfaces_its_message() {
+        let ws = workspace(
+            WorkspacePhase::Failed,
+            Some("provider 'workers': secret 'k' key 'v' not found"),
+        );
+        match admit(Some(&ws), None, "team-a-ws") {
+            Admission::Fail(msg) => assert_eq!(
+                msg,
+                "workspace 'team-a-ws' not ready: provider 'workers': secret 'k' key 'v' not found"
+            ),
+            _ => panic!("expected Fail"),
+        }
+    }
+
+    #[test]
+    fn admit_fails_a_missing_workspace() {
+        match admit(None, None, "gone-ws") {
+            Admission::Fail(msg) => assert_eq!(msg, "Workspace not found: 'gone-ws'"),
+            _ => panic!("expected Fail"),
+        }
+    }
+
+    #[test]
+    fn admit_fails_a_ready_workspace_with_a_dangling_provider_ref() {
+        let ws = workspace(WorkspacePhase::Ready, None);
+        match admit(Some(&ws), Some("nope"), "team-a-ws") {
+            Admission::Fail(msg) => {
+                assert_eq!(msg, "providerRef 'nope' names no provider in the workspace")
+            }
+            _ => panic!("expected Fail"),
+        }
+    }
 
     fn task_without_status() -> CalibanTask {
         let mut t = CalibanTask::new(
