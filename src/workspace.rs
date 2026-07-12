@@ -172,6 +172,85 @@ pub fn validate_workspace(
     }
 }
 
+/// A provider with its workspace context flattened in — the pinned form.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedProvider {
+    /// Provider name.
+    pub name: String,
+    /// Provider kind.
+    pub kind: String,
+    /// Base URL, if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Model, if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Credential Secret reference, if the provider needs one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_ref: Option<CredentialsRef>,
+}
+
+/// The workspace config a `CalibanTask` runs against, resolved to a single
+/// provider and pinned into `CalibanTaskStatus.resolvedWorkspace` at admission.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedWorkspace {
+    /// The workspace's source checkouts.
+    pub sources: Vec<Source>,
+    /// The single provider this task binds to.
+    pub provider: ResolvedProvider,
+    /// Non-secret env from the workspace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<EnvEntry>,
+    /// Workspace default isolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<IsolationSpec>,
+}
+
+/// Resolve a `WorkspaceSpec` + optional `providerRef` to a single-provider
+/// `ResolvedWorkspace`. Provider selection: explicit `provider_ref` →
+/// `defaultProvider` → the sole provider if there's exactly one. Errors on a
+/// dangling ref or an ambiguous choice.
+pub fn resolve_workspace(
+    spec: &WorkspaceSpec,
+    provider_ref: Option<&str>,
+) -> Result<ResolvedWorkspace, String> {
+    let chosen = match provider_ref {
+        Some(name) => spec
+            .providers
+            .iter()
+            .find(|p| p.name == name)
+            .ok_or_else(|| format!("providerRef '{name}' names no provider in the workspace"))?,
+        None => match &spec.default_provider {
+            Some(dp) => spec
+                .providers
+                .iter()
+                .find(|p| &p.name == dp)
+                .ok_or_else(|| format!("defaultProvider '{dp}' names no provider"))?,
+            None if spec.providers.len() == 1 => &spec.providers[0],
+            None => {
+                return Err(format!(
+                    "no providerRef and workspace has no defaultProvider among {} providers",
+                    spec.providers.len()
+                ))
+            }
+        },
+    };
+    Ok(ResolvedWorkspace {
+        sources: spec.sources.clone(),
+        provider: ResolvedProvider {
+            name: chosen.name.clone(),
+            kind: chosen.kind.clone(),
+            base_url: chosen.base_url.clone(),
+            model: chosen.model.clone(),
+            credentials_ref: chosen.credentials_ref.clone(),
+        },
+        env: spec.env.clone(),
+        isolation: spec.isolation.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +414,53 @@ spec:
             committed.trim(),
             "deploy/crd/workspace.yaml is stale — regenerate: cargo run --bin crdgen workspace > deploy/crd/workspace.yaml"
         );
+    }
+
+    #[test]
+    fn resolve_picks_named_provider() {
+        let spec = spec_with(
+            vec![
+                provider("planner", Some(("k", "v"))),
+                provider("workers", None),
+            ],
+            Some("planner"),
+        );
+        let r = resolve_workspace(&spec, Some("workers")).unwrap();
+        assert_eq!(r.provider.name, "workers");
+        assert_eq!(r.sources.len(), 1);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_default_provider() {
+        let spec = spec_with(
+            vec![provider("planner", None), provider("workers", None)],
+            Some("workers"),
+        );
+        let r = resolve_workspace(&spec, None).unwrap();
+        assert_eq!(r.provider.name, "workers");
+    }
+
+    #[test]
+    fn resolve_uses_sole_provider_when_no_default() {
+        let spec = spec_with(vec![provider("only", None)], None);
+        let r = resolve_workspace(&spec, None).unwrap();
+        assert_eq!(r.provider.name, "only");
+    }
+
+    #[test]
+    fn resolve_ambiguous_without_default_errors() {
+        let spec = spec_with(vec![provider("a", None), provider("b", None)], None);
+        let err = resolve_workspace(&spec, None).unwrap_err();
+        assert_eq!(
+            err,
+            "no providerRef and workspace has no defaultProvider among 2 providers"
+        );
+    }
+
+    #[test]
+    fn resolve_dangling_provider_ref_errors() {
+        let spec = spec_with(vec![provider("planner", None)], None);
+        let err = resolve_workspace(&spec, Some("nope")).unwrap_err();
+        assert_eq!(err, "providerRef 'nope' names no provider in the workspace");
     }
 }
