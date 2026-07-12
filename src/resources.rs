@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec,
-    ServiceAccount, VolumeMount, VolumeResourceRequirements,
+    Container, ContainerPort, EnvVar, EnvVarSource, PersistentVolumeClaimSpec, PodSpec,
+    PodTemplateSpec, SecretKeySelector, ServiceAccount, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -20,6 +20,7 @@ use kube::ResourceExt;
 use crate::config::{common_labels, netpol_name, owner_ref, sa_name, sandbox_name, Settings};
 use crate::crd::CalibanTask;
 use crate::sandbox::{Sandbox, SandboxSpec, VolumeClaimTemplate};
+use crate::workspace::ResolvedProvider;
 
 fn child_meta(t: &CalibanTask, name: String, labels: BTreeMap<String, String>) -> ObjectMeta {
     ObjectMeta {
@@ -106,6 +107,34 @@ fn caliband_env(t: &CalibanTask) -> Vec<EnvVar> {
         .and_then(|m| m.router_config_ref.clone())
     {
         e.push(env("CALIBAN_ROUTER_CONFIG_REF", r));
+    }
+    e
+}
+
+/// Project a resolved provider to caliband container env. Credentials reach the
+/// pod via `secretKeyRef` (the operator never inlines the value).
+#[allow(dead_code)]
+pub(crate) fn provider_env(rp: &ResolvedProvider) -> Vec<EnvVar> {
+    let mut e = vec![env("CALIBAN_PROVIDER", rp.kind.clone())];
+    if let Some(u) = &rp.base_url {
+        e.push(env("CALIBAN_PROVIDER_BASE_URL", u.clone()));
+    }
+    if let Some(m) = &rp.model {
+        e.push(env("CALIBAN_MODEL", m.clone()));
+    }
+    if let Some(c) = &rp.credentials_ref {
+        e.push(EnvVar {
+            name: "CALIBAN_API_KEY".to_string(),
+            value: None,
+            value_from: Some(EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    name: c.secret_name.clone(),
+                    key: c.key.clone(),
+                    optional: Some(false),
+                }),
+                ..Default::default()
+            }),
+        });
     }
     e
 }
@@ -478,6 +507,64 @@ mod tests {
         assert_eq!(
             p.sandbox.metadata.name.as_deref(),
             Some("refactor-auth-sbx")
+        );
+    }
+
+    #[test]
+    fn provider_env_projects_kind_url_model_and_secret_ref() {
+        use crate::workspace::{CredentialsRef, ResolvedProvider};
+        let rp = ResolvedProvider {
+            name: "planner".into(),
+            kind: "anthropic".into(),
+            base_url: Some("https://api.anthropic.com".into()),
+            model: Some("claude-opus-4-8".into()),
+            credentials_ref: Some(CredentialsRef {
+                secret_name: "anthropic-key".into(),
+                key: "api-key".into(),
+            }),
+        };
+        let env = provider_env(&rp);
+        let get = |n: &str| env.iter().find(|e| e.name == n).cloned();
+        assert_eq!(
+            get("CALIBAN_PROVIDER").unwrap().value.as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            get("CALIBAN_PROVIDER_BASE_URL").unwrap().value.as_deref(),
+            Some("https://api.anthropic.com")
+        );
+        assert_eq!(
+            get("CALIBAN_MODEL").unwrap().value.as_deref(),
+            Some("claude-opus-4-8")
+        );
+        // Secret reaches the pod by reference, never inlined.
+        let key = get("CALIBAN_API_KEY").unwrap();
+        assert!(key.value.is_none());
+        let sel = key.value_from.unwrap().secret_key_ref.unwrap();
+        assert_eq!(sel.name, "anthropic-key");
+        assert_eq!(sel.key, "api-key");
+    }
+
+    #[test]
+    fn provider_env_keyless_has_no_api_key() {
+        use crate::workspace::ResolvedProvider;
+        let rp = ResolvedProvider {
+            name: "workers".into(),
+            kind: "ollama".into(),
+            base_url: Some("http://192.168.1.240:11434".into()),
+            model: None,
+            credentials_ref: None,
+        };
+        let env = provider_env(&rp);
+        assert!(!env.iter().any(|e| e.name == "CALIBAN_API_KEY"));
+        assert!(!env.iter().any(|e| e.name == "CALIBAN_MODEL"));
+        assert_eq!(
+            env.iter()
+                .find(|e| e.name == "CALIBAN_PROVIDER")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("ollama")
         );
     }
 }
