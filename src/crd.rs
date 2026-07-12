@@ -199,7 +199,7 @@ pub struct WorkspaceStatus {
 }
 
 /// A minimal Kubernetes-style condition.
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Condition {
     /// Condition type (e.g. `Ready`).

@@ -16,7 +16,7 @@ use kube::runtime::Controller;
 use kube::{Api, Client, Resource, ResourceExt};
 
 use crate::config::{sandbox_name, Settings};
-use crate::crd::{CalibanTask, CalibanTaskStatus, NamedRef, Phase};
+use crate::crd::{CalibanTask, CalibanTaskStatus, Condition, NamedRef, Phase};
 use crate::resources::plan;
 use crate::sandbox::Sandbox;
 use crate::workspace::resolve_workspace;
@@ -63,6 +63,21 @@ pub(crate) fn derive_status(
     next.sandbox_ref = sandbox.map(|_| NamedRef {
         name: sandbox_name(t),
     });
+    // `derive_status` is the single owner of the `Ready` condition and is only
+    // ever reached after the workspace has resolved (the fail-fast branch in
+    // `reconcile` returns early, before this is called). So any
+    // `WorkspaceUnresolved` condition carried in the stale in-memory
+    // `t.status` (cloned above) is by definition stale and must not survive:
+    // derive it fresh from the phase instead of leaving whatever was there.
+    next.conditions = match phase {
+        Phase::Running => vec![Condition {
+            type_: "Ready".into(),
+            status: "True".into(),
+            reason: Some("Running".into()),
+            message: None,
+        }],
+        _ => Vec::new(),
+    };
     match &t.status {
         Some(cur) if status_eq(cur, &next) => None,
         _ => Some(next),
@@ -73,6 +88,7 @@ fn status_eq(a: &CalibanTaskStatus, b: &CalibanTaskStatus) -> bool {
     a.phase == b.phase
         && a.caliband_endpoint == b.caliband_endpoint
         && a.sandbox_ref.as_ref().map(|r| &r.name) == b.sandbox_ref.as_ref().map(|r| &r.name)
+        && a.conditions == b.conditions
 }
 
 /// Server-side apply `obj` under `name`, force-owned by the operator's field
@@ -103,17 +119,28 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
         None => {
             let ws_api: Api<Workspace> = Api::namespaced(ctx.client.clone(), &ns);
             let ws = ws_api.get_opt(&obj.spec.workspace_ref.name).await?;
-            match ws.and_then(|w| resolve_workspace(&w.spec, obj.spec.provider_ref.as_deref()).ok())
-            {
-                Some(rw) => {
+            // Distinguish "no such Workspace" from a `resolve_workspace` failure
+            // (dangling providerRef, ambiguous default, ...) so the specific
+            // reason makes it into the condition's human-readable `message`
+            // instead of collapsing every unresolved case into one generic
+            // string. `reason` stays the fixed `WorkspaceUnresolved`.
+            let resolution: Result<crate::workspace::ResolvedWorkspace, String> = match ws {
+                Some(w) => resolve_workspace(&w.spec, obj.spec.provider_ref.as_deref()),
+                None => Err(format!(
+                    "Workspace not found: '{}'",
+                    obj.spec.workspace_ref.name
+                )),
+            };
+            match resolution {
+                Ok(rw) => {
                     // Persist the pin immediately so it's stable for the run.
-                    // Also clear any stale `WorkspaceUnresolved` condition left
-                    // by a prior fail-fast reconcile: `derive_status` never
-                    // touches `conditions`, so without this the recovered task
-                    // would carry a permanent Ready=False alongside a healthy
-                    // phase.
+                    // Any stale `WorkspaceUnresolved` condition left by a prior
+                    // fail-fast reconcile is cleared once `derive_status` runs
+                    // later this same reconcile (it owns `conditions` and
+                    // derives them fresh from the phase), so it need not be
+                    // touched here.
                     let patch = serde_json::json!({
-                        "status": { "resolvedWorkspace": rw, "conditions": [] }
+                        "status": { "resolvedWorkspace": rw }
                     });
                     let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
                     task_api
@@ -121,12 +148,12 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
                         .await?;
                     rw
                 }
-                None => {
+                Err(reason) => {
                     let patch = serde_json::json!({
                         "status": { "phase": Phase::Failed,
                             "conditions": [{ "type": "Ready", "status": "False",
                                 "reason": "WorkspaceUnresolved",
-                                "message": format!("workspaceRef '{}' / providerRef unresolved", obj.spec.workspace_ref.name) }] }
+                                "message": reason }] }
                     });
                     let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
                     task_api
@@ -245,6 +272,7 @@ mod tests {
         let d = super::derive_status(&t, None, &Settings::default()).unwrap();
         assert_eq!(d.phase, Phase::Pending);
         assert!(d.caliband_endpoint.is_none());
+        assert!(d.conditions.is_empty());
     }
 
     #[test]
@@ -254,6 +282,7 @@ mod tests {
         let d = super::derive_status(&t, Some(&sb), &Settings::default()).unwrap();
         assert_eq!(d.phase, Phase::Provisioning);
         assert_eq!(d.sandbox_ref.unwrap().name, "refactor-auth-sbx");
+        assert!(d.conditions.is_empty());
     }
 
     #[test]
@@ -266,6 +295,10 @@ mod tests {
             d.caliband_endpoint.as_deref(),
             Some("refactor-auth-sbx.team-a.svc:8443")
         );
+        // Running phase must carry a derived Ready=True condition.
+        assert_eq!(d.conditions.len(), 1);
+        assert_eq!(d.conditions[0].type_, "Ready");
+        assert_eq!(d.conditions[0].status, "True");
     }
 
     #[test]
@@ -275,6 +308,39 @@ mod tests {
         // First derivation, then apply it as the observed status.
         t.status = super::derive_status(&t, Some(&sb), &Settings::default());
         assert!(super::derive_status(&t, Some(&sb), &Settings::default()).is_none());
+    }
+
+    #[test]
+    fn stale_workspace_unresolved_condition_does_not_survive_into_running() {
+        // Regression guard: a task carrying a stale `Ready=False /
+        // WorkspaceUnresolved` condition (left over from an earlier fail-fast
+        // reconcile) must NOT keep that condition once the workspace resolves
+        // and the Sandbox comes up Running. `derive_status` owns
+        // `conditions` and must derive them fresh from the phase it computes,
+        // not carry forward whatever was in the stale in-memory status.
+        let mut t = task_without_status();
+        t.status = Some(CalibanTaskStatus {
+            phase: Phase::Failed,
+            conditions: vec![Condition {
+                type_: "Ready".into(),
+                status: "False".into(),
+                reason: Some("WorkspaceUnresolved".into()),
+                message: Some("workspaceRef 'team-a-ws' / providerRef unresolved".into()),
+            }],
+            ..Default::default()
+        });
+        let sb = sandbox_with_fqdn(Some("refactor-auth-sbx.team-a.svc"));
+        let d = super::derive_status(&t, Some(&sb), &Settings::default()).unwrap();
+        assert_eq!(d.phase, Phase::Running);
+        assert!(
+            !d.conditions
+                .iter()
+                .any(|c| c.reason.as_deref() == Some("WorkspaceUnresolved")),
+            "stale WorkspaceUnresolved condition survived into Running: {:?}",
+            d.conditions
+        );
+        assert_eq!(d.conditions.len(), 1);
+        assert_eq!(d.conditions[0].status, "True");
     }
 
     #[test]
