@@ -122,10 +122,148 @@ pub enum WorkspacePhase {
     Failed,
 }
 
+/// Outcome of validating a `Workspace` against known Secret existence.
+pub struct WorkspaceValidation {
+    /// Derived phase (`Ready` or `Failed`).
+    pub phase: WorkspacePhase,
+    /// Human-readable failure detail, `None` when `Ready`.
+    pub message: Option<String>,
+}
+
+/// Pure validation of a `WorkspaceSpec`: unique provider names, a resolvable
+/// `defaultProvider`, and an existing Secret key for every `credentialsRef`.
+/// `secret_present(secret_name, key)` reports Secret-key existence (cluster
+/// lookup is the caller's responsibility). First problem found wins.
+pub fn validate_workspace(
+    spec: &WorkspaceSpec,
+    secret_present: impl Fn(&str, &str) -> bool,
+) -> WorkspaceValidation {
+    fn failed(message: String) -> WorkspaceValidation {
+        WorkspaceValidation {
+            phase: WorkspacePhase::Failed,
+            message: Some(message),
+        }
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    for p in &spec.providers {
+        if !seen.insert(p.name.as_str()) {
+            return failed(format!("duplicate provider name '{}'", p.name));
+        }
+    }
+    if let Some(dp) = &spec.default_provider {
+        if !spec.providers.iter().any(|p| &p.name == dp) {
+            return failed(format!("defaultProvider '{dp}' names no provider"));
+        }
+    }
+    for p in &spec.providers {
+        if let Some(c) = &p.credentials_ref {
+            if !secret_present(&c.secret_name, &c.key) {
+                return failed(format!(
+                    "provider '{}': secret '{}' key '{}' not found",
+                    p.name, c.secret_name, c.key
+                ));
+            }
+        }
+    }
+    WorkspaceValidation {
+        phase: WorkspacePhase::Ready,
+        message: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kube::CustomResourceExt;
+
+    fn spec_with(providers: Vec<Provider>, default_provider: Option<&str>) -> WorkspaceSpec {
+        WorkspaceSpec {
+            display_name: "Team A".into(),
+            sources: vec![Source {
+                name: "caliban".into(),
+                repo: "git@x:caliban".into(),
+                r#ref: "main".into(),
+                path: "/work/caliban".into(),
+            }],
+            providers,
+            default_provider: default_provider.map(String::from),
+            env: vec![],
+            isolation: None,
+        }
+    }
+
+    fn provider(name: &str, cred: Option<(&str, &str)>) -> Provider {
+        Provider {
+            name: name.into(),
+            kind: "anthropic".into(),
+            base_url: None,
+            model: None,
+            credentials_ref: cred.map(|(s, k)| CredentialsRef {
+                secret_name: s.into(),
+                key: k.into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn valid_workspace_is_ready() {
+        let spec = spec_with(
+            vec![provider("planner", Some(("anthropic-key", "api-key")))],
+            Some("planner"),
+        );
+        let v = validate_workspace(&spec, |s, k| s == "anthropic-key" && k == "api-key");
+        assert_eq!(v.phase, WorkspacePhase::Ready);
+        assert!(v.message.is_none());
+    }
+
+    #[test]
+    fn keyless_provider_needs_no_secret() {
+        let mut p = provider("workers", None);
+        p.kind = "ollama".into();
+        let spec = spec_with(vec![p], None);
+        let v = validate_workspace(&spec, |_, _| false); // no secrets exist at all
+        assert_eq!(v.phase, WorkspacePhase::Ready);
+    }
+
+    #[test]
+    fn missing_secret_fails_with_message() {
+        let spec = spec_with(
+            vec![provider("planner", Some(("anthropic-key", "api-key")))],
+            None,
+        );
+        let v = validate_workspace(&spec, |_, _| false);
+        assert_eq!(v.phase, WorkspacePhase::Failed);
+        assert_eq!(
+            v.message.as_deref(),
+            Some("provider 'planner': secret 'anthropic-key' key 'api-key' not found")
+        );
+    }
+
+    #[test]
+    fn duplicate_provider_names_fail() {
+        let spec = spec_with(
+            vec![provider("planner", None), provider("planner", None)],
+            None,
+        );
+        let v = validate_workspace(&spec, |_, _| true);
+        assert_eq!(v.phase, WorkspacePhase::Failed);
+        assert_eq!(
+            v.message.as_deref(),
+            Some("duplicate provider name 'planner'")
+        );
+    }
+
+    #[test]
+    fn dangling_default_provider_fails() {
+        let spec = spec_with(vec![provider("planner", None)], Some("nope"));
+        let v = validate_workspace(&spec, |_, _| true);
+        assert_eq!(v.phase, WorkspacePhase::Failed);
+        assert_eq!(
+            v.message.as_deref(),
+            Some("defaultProvider 'nope' names no provider")
+        );
+    }
 
     #[test]
     fn crd_has_correct_group_version_kind() {
