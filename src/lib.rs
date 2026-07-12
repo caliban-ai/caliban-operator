@@ -7,5 +7,8 @@ pub mod controller;
 pub mod crd;
 pub mod resources;
 pub mod sandbox;
+pub mod workspace;
+pub mod workspace_controller;
 
 pub use crd::{CalibanTask, CalibanTaskSpec, CalibanTaskStatus, Phase};
+pub use workspace::{Workspace, WorkspaceSpec, WorkspaceStatus};

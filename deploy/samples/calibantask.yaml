@@ -1,0 +1,9 @@
+apiVersion: caliban.caliban-ai.dev/v1alpha1
+kind: CalibanTask
+metadata:
+  name: refactor-auth
+  namespace: team-a
+spec:
+  workspaceRef: { name: team-a-ws }
+  providerRef: workers
+  task: { prompt: "refactor the auth module", agentType: general-purpose }

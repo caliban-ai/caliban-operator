@@ -16,9 +16,11 @@ use kube::runtime::Controller;
 use kube::{Api, Client, Resource, ResourceExt};
 
 use crate::config::{sandbox_name, Settings};
-use crate::crd::{CalibanTask, CalibanTaskStatus, NamedRef, Phase};
+use crate::crd::{CalibanTask, CalibanTaskStatus, Condition, NamedRef, Phase};
 use crate::resources::plan;
 use crate::sandbox::Sandbox;
+use crate::workspace::resolve_workspace;
+use crate::workspace::Workspace;
 
 /// Controller error.
 #[derive(thiserror::Error, Debug)]
@@ -61,6 +63,21 @@ pub(crate) fn derive_status(
     next.sandbox_ref = sandbox.map(|_| NamedRef {
         name: sandbox_name(t),
     });
+    // `derive_status` is the single owner of the `Ready` condition and is only
+    // ever reached after the workspace has resolved (the fail-fast branch in
+    // `reconcile` returns early, before this is called). So any
+    // `WorkspaceUnresolved` condition carried in the stale in-memory
+    // `t.status` (cloned above) is by definition stale and must not survive:
+    // derive it fresh from the phase instead of leaving whatever was there.
+    next.conditions = match phase {
+        Phase::Running => vec![Condition {
+            type_: "Ready".into(),
+            status: "True".into(),
+            reason: Some("Running".into()),
+            message: None,
+        }],
+        _ => Vec::new(),
+    };
     match &t.status {
         Some(cur) if status_eq(cur, &next) => None,
         _ => Some(next),
@@ -71,6 +88,7 @@ fn status_eq(a: &CalibanTaskStatus, b: &CalibanTaskStatus) -> bool {
     a.phase == b.phase
         && a.caliband_endpoint == b.caliband_endpoint
         && a.sandbox_ref.as_ref().map(|r| &r.name) == b.sandbox_ref.as_ref().map(|r| &r.name)
+        && a.conditions == b.conditions
 }
 
 /// Server-side apply `obj` under `name`, force-owned by the operator's field
@@ -89,7 +107,65 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
     let ns = obj.namespace().unwrap_or_default();
     let name = obj.name_any();
     let s = &ctx.settings;
-    let p = plan(&obj, s);
+
+    // Pin once: a running task keeps the config it was admitted with. Later
+    // edits to the referenced `Workspace` don't re-pin (or disturb) a running task.
+    let resolved = match obj
+        .status
+        .as_ref()
+        .and_then(|st| st.resolved_workspace.clone())
+    {
+        Some(rw) => rw,
+        None => {
+            let ws_api: Api<Workspace> = Api::namespaced(ctx.client.clone(), &ns);
+            let ws = ws_api.get_opt(&obj.spec.workspace_ref.name).await?;
+            // Distinguish "no such Workspace" from a `resolve_workspace` failure
+            // (dangling providerRef, ambiguous default, ...) so the specific
+            // reason makes it into the condition's human-readable `message`
+            // instead of collapsing every unresolved case into one generic
+            // string. `reason` stays the fixed `WorkspaceUnresolved`.
+            let resolution: Result<crate::workspace::ResolvedWorkspace, String> = match ws {
+                Some(w) => resolve_workspace(&w.spec, obj.spec.provider_ref.as_deref()),
+                None => Err(format!(
+                    "Workspace not found: '{}'",
+                    obj.spec.workspace_ref.name
+                )),
+            };
+            match resolution {
+                Ok(rw) => {
+                    // Persist the pin immediately so it's stable for the run.
+                    // Any stale `WorkspaceUnresolved` condition left by a prior
+                    // fail-fast reconcile is cleared once `derive_status` runs
+                    // later this same reconcile (it owns `conditions` and
+                    // derives them fresh from the phase), so it need not be
+                    // touched here.
+                    let patch = serde_json::json!({
+                        "status": { "resolvedWorkspace": rw }
+                    });
+                    let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
+                    task_api
+                        .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+                        .await?;
+                    rw
+                }
+                Err(reason) => {
+                    let patch = serde_json::json!({
+                        "status": { "phase": Phase::Failed,
+                            "conditions": [{ "type": "Ready", "status": "False",
+                                "reason": "WorkspaceUnresolved",
+                                "message": reason }] }
+                    });
+                    let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
+                    task_api
+                        .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+                        .await?;
+                    tracing::warn!(%ns, %name, "workspace unresolved; task Failed");
+                    return Ok(Action::requeue(Duration::from_secs(30)));
+                }
+            }
+        }
+    };
+    let p = plan(&obj, &resolved, s);
 
     // Apply children (idempotent SSA; owner refs cascade-delete).
     let sa_api: Api<ServiceAccount> = Api::namespaced(ctx.client.clone(), &ns);
@@ -143,7 +219,7 @@ pub async fn run(client: Client) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{CalibanTaskSpec, Source, TaskSpec, Workspace};
+    use crate::crd::{CalibanTaskSpec, TaskSpec, WorkspaceRef};
     use crate::sandbox::{SandboxSpec, SandboxStatus};
     use k8s_openapi::api::core::v1::PodTemplateSpec;
 
@@ -151,15 +227,10 @@ mod tests {
         let mut t = CalibanTask::new(
             "refactor-auth",
             CalibanTaskSpec {
-                workspace: Workspace {
-                    sources: vec![Source {
-                        name: "caliban".into(),
-                        repo: "git@x:caliban".into(),
-                        r#ref: "main".into(),
-                        path: "/work/caliban".into(),
-                    }],
-                    services: vec![],
+                workspace_ref: WorkspaceRef {
+                    name: "team-a-ws".into(),
                 },
+                provider_ref: None,
                 task: TaskSpec {
                     prompt: "hi".into(),
                     agent_type: None,
@@ -169,6 +240,7 @@ mod tests {
                 isolation: None,
                 resources: None,
                 lifecycle: None,
+                tools: None,
             },
         );
         t.metadata.namespace = Some("team-a".into());
@@ -200,6 +272,7 @@ mod tests {
         let d = super::derive_status(&t, None, &Settings::default()).unwrap();
         assert_eq!(d.phase, Phase::Pending);
         assert!(d.caliband_endpoint.is_none());
+        assert!(d.conditions.is_empty());
     }
 
     #[test]
@@ -209,6 +282,7 @@ mod tests {
         let d = super::derive_status(&t, Some(&sb), &Settings::default()).unwrap();
         assert_eq!(d.phase, Phase::Provisioning);
         assert_eq!(d.sandbox_ref.unwrap().name, "refactor-auth-sbx");
+        assert!(d.conditions.is_empty());
     }
 
     #[test]
@@ -221,6 +295,10 @@ mod tests {
             d.caliband_endpoint.as_deref(),
             Some("refactor-auth-sbx.team-a.svc:8443")
         );
+        // Running phase must carry a derived Ready=True condition.
+        assert_eq!(d.conditions.len(), 1);
+        assert_eq!(d.conditions[0].type_, "Ready");
+        assert_eq!(d.conditions[0].status, "True");
     }
 
     #[test]
@@ -230,6 +308,39 @@ mod tests {
         // First derivation, then apply it as the observed status.
         t.status = super::derive_status(&t, Some(&sb), &Settings::default());
         assert!(super::derive_status(&t, Some(&sb), &Settings::default()).is_none());
+    }
+
+    #[test]
+    fn stale_workspace_unresolved_condition_does_not_survive_into_running() {
+        // Regression guard: a task carrying a stale `Ready=False /
+        // WorkspaceUnresolved` condition (left over from an earlier fail-fast
+        // reconcile) must NOT keep that condition once the workspace resolves
+        // and the Sandbox comes up Running. `derive_status` owns
+        // `conditions` and must derive them fresh from the phase it computes,
+        // not carry forward whatever was in the stale in-memory status.
+        let mut t = task_without_status();
+        t.status = Some(CalibanTaskStatus {
+            phase: Phase::Failed,
+            conditions: vec![Condition {
+                type_: "Ready".into(),
+                status: "False".into(),
+                reason: Some("WorkspaceUnresolved".into()),
+                message: Some("workspaceRef 'team-a-ws' / providerRef unresolved".into()),
+            }],
+            ..Default::default()
+        });
+        let sb = sandbox_with_fqdn(Some("refactor-auth-sbx.team-a.svc"));
+        let d = super::derive_status(&t, Some(&sb), &Settings::default()).unwrap();
+        assert_eq!(d.phase, Phase::Running);
+        assert!(
+            !d.conditions
+                .iter()
+                .any(|c| c.reason.as_deref() == Some("WorkspaceUnresolved")),
+            "stale WorkspaceUnresolved condition survived into Running: {:?}",
+            d.conditions
+        );
+        assert_eq!(d.conditions.len(), 1);
+        assert_eq!(d.conditions[0].status, "True");
     }
 
     #[test]
@@ -257,5 +368,12 @@ mod tests {
         // Merge-patch needs explicit null (not absent) to delete the stale values.
         assert!(v.get("calibandEndpoint").is_some_and(|x| x.is_null()));
         assert!(v.get("sandboxRef").is_some_and(|x| x.is_null()));
+        // Regression guard: a Running->Pending transition must serialize
+        // `conditions` as an explicit empty array, not omit the key. Under
+        // JSON Merge Patch an omitted key is left unchanged server-side, so
+        // if `conditions` were skipped here the stale `Ready=True` condition
+        // would never be cleared and every subsequent reconcile would keep
+        // re-patching (endless churn).
+        assert_eq!(v.get("conditions"), Some(&serde_json::json!([])));
     }
 }

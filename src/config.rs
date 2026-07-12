@@ -93,21 +93,16 @@ pub fn owner_ref(t: &CalibanTask) -> OwnerReference {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{CalibanTask, CalibanTaskSpec, Source, TaskSpec, Workspace};
+    use crate::crd::{CalibanTask, CalibanTaskSpec, TaskSpec, WorkspaceRef};
 
     fn task() -> CalibanTask {
         let mut t = CalibanTask::new(
             "refactor-auth",
             CalibanTaskSpec {
-                workspace: Workspace {
-                    sources: vec![Source {
-                        name: "caliban".into(),
-                        repo: "git@x:caliban".into(),
-                        r#ref: "main".into(),
-                        path: "/work/caliban".into(),
-                    }],
-                    services: vec![],
+                workspace_ref: WorkspaceRef {
+                    name: "team-a-ws".into(),
                 },
+                provider_ref: None,
                 task: TaskSpec {
                     prompt: "hi".into(),
                     agent_type: None,
@@ -117,6 +112,7 @@ mod tests {
                 isolation: None,
                 resources: None,
                 lifecycle: None,
+                tools: None,
             },
         );
         t.metadata.namespace = Some("team-a".into());
