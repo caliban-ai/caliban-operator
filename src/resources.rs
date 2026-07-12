@@ -20,7 +20,7 @@ use kube::ResourceExt;
 use crate::config::{common_labels, netpol_name, owner_ref, sa_name, sandbox_name, Settings};
 use crate::crd::CalibanTask;
 use crate::sandbox::{Sandbox, SandboxSpec, VolumeClaimTemplate};
-use crate::workspace::ResolvedProvider;
+use crate::workspace::{ResolvedProvider, ResolvedWorkspace};
 
 fn child_meta(t: &CalibanTask, name: String, labels: BTreeMap<String, String>) -> ObjectMeta {
     ObjectMeta {
@@ -90,7 +90,7 @@ fn env(name: &str, value: String) -> EnvVar {
     }
 }
 
-fn caliband_env(t: &CalibanTask) -> Vec<EnvVar> {
+fn caliband_env(t: &CalibanTask, rw: &ResolvedWorkspace) -> Vec<EnvVar> {
     let mut e = vec![];
     if let Some(ep) = t
         .spec
@@ -108,12 +108,15 @@ fn caliband_env(t: &CalibanTask) -> Vec<EnvVar> {
     {
         e.push(env("CALIBAN_ROUTER_CONFIG_REF", r));
     }
+    e.extend(provider_env(&rw.provider));
+    for kv in &rw.env {
+        e.push(env(&kv.name, kv.value.clone()));
+    }
     e
 }
 
 /// Project a resolved provider to caliband container env. Credentials reach the
 /// pod via `secretKeyRef` (the operator never inlines the value).
-#[allow(dead_code)]
 pub(crate) fn provider_env(rp: &ResolvedProvider) -> Vec<EnvVar> {
     let mut e = vec![env("CALIBAN_PROVIDER", rp.kind.clone())];
     if let Some(u) = &rp.base_url {
@@ -147,9 +150,9 @@ fn sh_squote(v: &str) -> String {
 /// Build the idempotent clone script for the init container: for each workspace
 /// source, clone `repo` at `ref` into `path` unless it's already a git checkout
 /// (so pause/resume and pod restarts over the persistent PVC don't refetch).
-fn clone_script(t: &CalibanTask) -> String {
+fn clone_script(rw: &ResolvedWorkspace) -> String {
     let mut s = String::from("set -eu\n");
-    for src in &t.spec.workspace.sources {
+    for src in &rw.sources {
         s.push_str(&format!(
             "if [ ! -d {git} ]; then git clone --depth 1 --branch {r} {repo} {path}; fi\n",
             git = sh_squote(&format!("{}/.git", src.path)),
@@ -161,10 +164,10 @@ fn clone_script(t: &CalibanTask) -> String {
     s
 }
 
-/// The git-clone init container that populates the workspace volume from
-/// `spec.workspace.sources[]`, if any are configured.
-fn clone_init_container(t: &CalibanTask, s: &Settings) -> Option<Container> {
-    if t.spec.workspace.sources.is_empty() {
+/// The git-clone init container that populates the workspace volume from the
+/// resolved workspace's `sources[]`, if any are configured.
+fn clone_init_container(rw: &ResolvedWorkspace, s: &Settings) -> Option<Container> {
+    if rw.sources.is_empty() {
         return None;
     }
     Some(Container {
@@ -173,7 +176,7 @@ fn clone_init_container(t: &CalibanTask, s: &Settings) -> Option<Container> {
         command: Some(vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            clone_script(t),
+            clone_script(rw),
         ]),
         volume_mounts: Some(vec![VolumeMount {
             name: WORKSPACE_VOLUME.to_string(),
@@ -205,8 +208,9 @@ fn workspace_pvc(s: &Settings) -> VolumeClaimTemplate {
     }
 }
 
-/// Map a `CalibanTask` to its backing agent-sandbox `Sandbox`.
-pub fn build_sandbox(t: &CalibanTask, s: &Settings) -> Sandbox {
+/// Map a `CalibanTask` + its resolved workspace to the backing agent-sandbox
+/// `Sandbox`.
+pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> Sandbox {
     let labels = common_labels(t);
     let container = Container {
         name: "caliband".to_string(),
@@ -222,7 +226,7 @@ pub fn build_sandbox(t: &CalibanTask, s: &Settings) -> Sandbox {
             "--listen".to_string(),
             format!("0.0.0.0:{}", s.caliband_port),
         ]),
-        env: Some(caliband_env(t)),
+        env: Some(caliband_env(t, rw)),
         volume_mounts: Some(vec![VolumeMount {
             name: WORKSPACE_VOLUME.to_string(),
             mount_path: s.workspace_root.clone(),
@@ -232,12 +236,14 @@ pub fn build_sandbox(t: &CalibanTask, s: &Settings) -> Sandbox {
     };
     let pod_spec = PodSpec {
         containers: vec![container],
-        init_containers: clone_init_container(t, s).map(|c| vec![c]),
+        init_containers: clone_init_container(rw, s).map(|c| vec![c]),
+        // The task's per-run override takes precedence over the workspace default.
         runtime_class_name: t
             .spec
             .isolation
             .as_ref()
-            .and_then(|i| i.runtime_class.clone()),
+            .and_then(|i| i.runtime_class.clone())
+            .or_else(|| rw.isolation.as_ref().and_then(|i| i.runtime_class.clone())),
         service_account_name: Some(sa_name(t)),
         automount_service_account_token: Some(false),
         ..Default::default()
@@ -274,32 +280,27 @@ pub struct ReconcilePlan {
 }
 
 /// Assemble every child object for a task (pure).
-pub fn plan(t: &CalibanTask, s: &Settings) -> ReconcilePlan {
+pub fn plan(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> ReconcilePlan {
     ReconcilePlan {
         service_account: build_service_account(t),
         network_policy: build_network_policy(t, s),
-        sandbox: build_sandbox(t, s),
+        sandbox: build_sandbox(t, rw, s),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{CalibanTaskSpec, Source, TaskSpec, Workspace};
+    use crate::crd::{CalibanTaskSpec, Source, TaskSpec, WorkspaceRef};
 
     fn task() -> CalibanTask {
         let mut t = CalibanTask::new(
             "refactor-auth",
             CalibanTaskSpec {
-                workspace: Workspace {
-                    sources: vec![Source {
-                        name: "caliban".into(),
-                        repo: "git@x:caliban".into(),
-                        r#ref: "main".into(),
-                        path: "/work/caliban".into(),
-                    }],
-                    services: vec![],
+                workspace_ref: WorkspaceRef {
+                    name: "team-a-ws".into(),
                 },
+                provider_ref: None,
                 task: TaskSpec {
                     prompt: "hi".into(),
                     agent_type: None,
@@ -309,11 +310,33 @@ mod tests {
                 isolation: None,
                 resources: None,
                 lifecycle: None,
+                tools: None,
             },
         );
         t.metadata.namespace = Some("team-a".into());
         t.metadata.uid = Some("uid-123".into());
         t
+    }
+
+    fn resolved() -> crate::workspace::ResolvedWorkspace {
+        use crate::workspace::{ResolvedProvider, ResolvedWorkspace};
+        ResolvedWorkspace {
+            sources: vec![Source {
+                name: "caliban".into(),
+                repo: "git@x:caliban".into(),
+                r#ref: "main".into(),
+                path: "/work/caliban".into(),
+            }],
+            provider: ResolvedProvider {
+                name: "workers".into(),
+                kind: "ollama".into(),
+                base_url: None,
+                model: None,
+                credentials_ref: None,
+            },
+            env: vec![],
+            isolation: None,
+        }
     }
 
     #[test]
@@ -362,7 +385,7 @@ mod tests {
     #[test]
     fn sandbox_has_caliband_container_pvc_and_service() {
         let s = Settings::default();
-        let sb = build_sandbox(&task(), &s);
+        let sb = build_sandbox(&task(), &resolved(), &s);
         assert_eq!(sb.metadata.name.as_deref(), Some("refactor-auth-sbx"));
         assert_eq!(sb.metadata.namespace.as_deref(), Some("team-a"));
         assert_eq!(sb.spec.service, Some(true));
@@ -414,7 +437,7 @@ mod tests {
     #[test]
     fn sandbox_has_git_clone_init_container_for_workspace_sources() {
         let s = Settings::default();
-        let sb = build_sandbox(&task(), &s);
+        let sb = build_sandbox(&task(), &resolved(), &s);
         let pod = sb.spec.pod_template.spec.unwrap();
         let inits = pod.init_containers.expect("init containers present");
         assert_eq!(inits.len(), 1);
@@ -440,9 +463,10 @@ mod tests {
 
     #[test]
     fn clone_script_shell_escapes_source_values() {
-        let mut t = task();
-        t.spec.workspace.sources[0].repo = "https://x/a'b".into();
-        let sb = build_sandbox(&t, &Settings::default());
+        let t = task();
+        let mut rw = resolved();
+        rw.sources[0].repo = "https://x/a'b".into();
+        let sb = build_sandbox(&t, &rw, &Settings::default());
         let pod = sb.spec.pod_template.spec.unwrap();
         let init = &pod.init_containers.unwrap()[0];
         let script = &init.command.as_ref().unwrap()[2];
@@ -452,9 +476,10 @@ mod tests {
 
     #[test]
     fn sandbox_omits_init_containers_when_no_workspace_sources() {
-        let mut t = task();
-        t.spec.workspace.sources = vec![];
-        let sb = build_sandbox(&t, &Settings::default());
+        let t = task();
+        let mut rw = resolved();
+        rw.sources = vec![];
+        let sb = build_sandbox(&t, &rw, &Settings::default());
         let pod = sb.spec.pod_template.spec.unwrap();
         assert!(pod.init_containers.is_none());
     }
@@ -467,7 +492,53 @@ mod tests {
             runtime_class: Some("gvisor".into()),
             worktrees: None,
         });
-        let sb = build_sandbox(&t, &Settings::default());
+        let sb = build_sandbox(&t, &resolved(), &Settings::default());
+        assert_eq!(
+            sb.spec
+                .pod_template
+                .spec
+                .unwrap()
+                .runtime_class_name
+                .as_deref(),
+            Some("gvisor")
+        );
+    }
+
+    #[test]
+    fn sandbox_runtime_class_falls_back_to_workspace_isolation() {
+        use crate::crd::IsolationSpec;
+        let t = task();
+        let mut rw = resolved();
+        rw.isolation = Some(IsolationSpec {
+            runtime_class: Some("kata".into()),
+            worktrees: None,
+        });
+        let sb = build_sandbox(&t, &rw, &Settings::default());
+        assert_eq!(
+            sb.spec
+                .pod_template
+                .spec
+                .unwrap()
+                .runtime_class_name
+                .as_deref(),
+            Some("kata")
+        );
+    }
+
+    #[test]
+    fn sandbox_runtime_class_task_override_wins_over_workspace() {
+        use crate::crd::IsolationSpec;
+        let mut t = task();
+        t.spec.isolation = Some(IsolationSpec {
+            runtime_class: Some("gvisor".into()),
+            worktrees: None,
+        });
+        let mut rw = resolved();
+        rw.isolation = Some(IsolationSpec {
+            runtime_class: Some("kata".into()),
+            worktrees: None,
+        });
+        let sb = build_sandbox(&t, &rw, &Settings::default());
         assert_eq!(
             sb.spec
                 .pod_template
@@ -486,7 +557,7 @@ mod tests {
         t.spec.model = Some(ModelSpec {
             router_config_ref: Some("caliban-router".into()),
         });
-        let sb = build_sandbox(&t, &Settings::default());
+        let sb = build_sandbox(&t, &resolved(), &Settings::default());
         let pod = sb.spec.pod_template.spec.unwrap();
         let env = pod.containers[0].env.as_ref().unwrap();
         assert!(env.iter().any(|e| e.name == "CALIBAN_ROUTER_CONFIG_REF"
@@ -494,8 +565,28 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_projects_resolved_provider_and_workspace_env() {
+        use crate::workspace::EnvEntry;
+        let t = task();
+        let mut rw = resolved();
+        rw.env = vec![EnvEntry {
+            name: "FOO".into(),
+            value: "bar".into(),
+        }];
+        let sb = build_sandbox(&t, &rw, &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let env = pod.containers[0].env.as_ref().unwrap();
+        assert!(env
+            .iter()
+            .any(|e| e.name == "CALIBAN_PROVIDER" && e.value.as_deref() == Some("ollama")));
+        assert!(env
+            .iter()
+            .any(|e| e.name == "FOO" && e.value.as_deref() == Some("bar")));
+    }
+
+    #[test]
     fn plan_names_all_three_children() {
-        let p = plan(&task(), &Settings::default());
+        let p = plan(&task(), &resolved(), &Settings::default());
         assert_eq!(
             p.service_account.metadata.name.as_deref(),
             Some("refactor-auth-sa")

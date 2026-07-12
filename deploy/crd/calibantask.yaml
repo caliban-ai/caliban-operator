@@ -63,6 +63,12 @@ spec:
                     nullable: true
                     type: string
                 type: object
+              providerRef:
+                description: |-
+                  Which of the workspace's providers to bind; defaults to the workspace's
+                  `defaultProvider` (or its sole provider).
+                nullable: true
+                type: string
               resources:
                 description: 'Resource class → a SandboxTemplate (consumed in #283).'
                 nullable: true
@@ -99,49 +105,25 @@ spec:
                 required:
                 - prompt
                 type: object
-              workspace:
-                description: The workspace (1..N source checkouts) the task runs over.
+              tools:
+                description: Per-run tool override (allow-list) for this task's agents.
+                items:
+                  type: string
+                nullable: true
+                type: array
+              workspaceRef:
+                description: Reference to the namespace-local `Workspace` this task runs against.
                 properties:
-                  services:
-                    default: []
-                    description: Optional in-pod aux services (e.g. gonzalod, prosperod) for e2e.
-                    items:
-                      type: string
-                    type: array
-                  sources:
-                    description: The guaranteed source checkouts (runtime-extensible).
-                    items:
-                      description: A single source checkout in the workspace.
-                      properties:
-                        name:
-                          description: Source identifier (matches caliband's workspace source name).
-                          minLength: 1
-                          type: string
-                        path:
-                          description: Absolute mount path in the pod (e.g. `/work/caliban`).
-                          minLength: 1
-                          type: string
-                        ref:
-                          default: main
-                          description: Git ref to check out. Defaults to `main`.
-                          type: string
-                        repo:
-                          description: Git remote to clone.
-                          minLength: 1
-                          type: string
-                      required:
-                      - name
-                      - path
-                      - repo
-                      type: object
-                    minItems: 1
-                    type: array
+                  name:
+                    description: Workspace object name.
+                    minLength: 1
+                    type: string
                 required:
-                - sources
+                - name
                 type: object
             required:
             - task
-            - workspace
+            - workspaceRef
             type: object
           status:
             description: Observed state of a `CalibanTask`.
@@ -190,6 +172,110 @@ spec:
                 - Completed
                 - Failed
                 type: string
+              resolvedWorkspace:
+                description: |-
+                  Resolved workspace config, pinned at admission (immutable run). Set once;
+                  later `Workspace` edits don't re-pin a running task.
+                nullable: true
+                properties:
+                  env:
+                    description: Non-secret env from the workspace.
+                    items:
+                      description: A non-secret environment entry.
+                      properties:
+                        name:
+                          description: Variable name.
+                          minLength: 1
+                          type: string
+                        value:
+                          description: Variable value.
+                          type: string
+                      required:
+                      - name
+                      - value
+                      type: object
+                    type: array
+                  isolation:
+                    description: Workspace default isolation.
+                    nullable: true
+                    properties:
+                      runtimeClass:
+                        description: RuntimeClass (e.g. `gvisor`, `kata`).
+                        nullable: true
+                        type: string
+                      worktrees:
+                        description: Worktree isolation strategy (e.g. `per-source`).
+                        nullable: true
+                        type: string
+                    type: object
+                  provider:
+                    description: The single provider this task binds to.
+                    properties:
+                      baseUrl:
+                        description: Base URL, if set.
+                        nullable: true
+                        type: string
+                      credentialsRef:
+                        description: Credential Secret reference, if the provider needs one.
+                        nullable: true
+                        properties:
+                          key:
+                            description: Key within the Secret's data.
+                            minLength: 1
+                            type: string
+                          secretName:
+                            description: Name of the Secret (same namespace).
+                            minLength: 1
+                            type: string
+                        required:
+                        - key
+                        - secretName
+                        type: object
+                      kind:
+                        description: Provider kind.
+                        type: string
+                      model:
+                        description: Model, if set.
+                        nullable: true
+                        type: string
+                      name:
+                        description: Provider name.
+                        type: string
+                    required:
+                    - kind
+                    - name
+                    type: object
+                  sources:
+                    description: The workspace's source checkouts.
+                    items:
+                      description: A single source checkout in the workspace.
+                      properties:
+                        name:
+                          description: Source identifier (matches caliband's workspace source name).
+                          minLength: 1
+                          type: string
+                        path:
+                          description: Absolute mount path in the pod (e.g. `/work/caliban`).
+                          minLength: 1
+                          type: string
+                        ref:
+                          default: main
+                          description: Git ref to check out. Defaults to `main`.
+                          type: string
+                        repo:
+                          description: Git remote to clone.
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      - path
+                      - repo
+                      type: object
+                    type: array
+                required:
+                - provider
+                - sources
+                type: object
               sandboxRef:
                 description: The agent-sandbox Sandbox backing this task.
                 nullable: true

@@ -19,8 +19,12 @@ use serde::{Deserialize, Serialize};
 )]
 #[serde(rename_all = "camelCase")]
 pub struct CalibanTaskSpec {
-    /// The workspace (1..N source checkouts) the task runs over.
-    pub workspace: Workspace,
+    /// Reference to the namespace-local `Workspace` this task runs against.
+    pub workspace_ref: WorkspaceRef,
+    /// Which of the workspace's providers to bind; defaults to the workspace's
+    /// `defaultProvider` (or its sole provider).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_ref: Option<String>,
     /// The task itself.
     pub task: TaskSpec,
     /// Model-router configuration.
@@ -38,18 +42,18 @@ pub struct CalibanTaskSpec {
     /// Idle/drain lifecycle policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<LifecycleSpec>,
+    /// Per-run tool override (allow-list) for this task's agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
 }
 
-/// A workspace: the provisioned source set + optional in-pod aux services.
+/// A by-name reference to a `Workspace` in the same namespace.
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct Workspace {
-    /// The guaranteed source checkouts (runtime-extensible).
+pub struct WorkspaceRef {
+    /// Workspace object name.
     #[schemars(length(min = 1))]
-    pub sources: Vec<Source>,
-    /// Optional in-pod aux services (e.g. gonzalod, prosperod) for e2e.
-    #[serde(default)]
-    pub services: Vec<String>,
+    pub name: String,
 }
 
 /// A single source checkout in the workspace.
@@ -171,6 +175,10 @@ pub struct CalibanTaskStatus {
     /// Standard Kubernetes conditions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
+    /// Resolved workspace config, pinned at admission (immutable run). Set once;
+    /// later `Workspace` edits don't re-pin a running task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_workspace: Option<crate::workspace::ResolvedWorkspace>,
 }
 
 /// A by-name reference to another object in the same namespace.
@@ -234,16 +242,11 @@ mod tests {
     const SAMPLE: &str = r#"
 apiVersion: caliban.caliban-ai.dev/v1alpha1
 kind: CalibanTask
-metadata:
-  name: refactor-auth
-  namespace: team-a
+metadata: { name: refactor-auth, namespace: team-a }
 spec:
-  workspace:
-    sources:
-      - { name: caliban,  repo: "git@example:caliban",  ref: main,       path: /work/caliban }
-      - { name: prospero, repo: "git@example:prospero", ref: feat-xport, path: /work/prospero }
-    services: [ gonzalod, prosperod ]
-  task:      { prompt: "refactor the auth module", agentType: general-purpose }
+  workspaceRef: { name: team-a-ws }
+  providerRef: planner
+  task: { prompt: "refactor the auth module", agentType: general-purpose }
   model:     { routerConfigRef: caliban-router }
   state:     { gonzaloEndpoint: gonzalod.storage.svc, mode: remote }
   isolation: { runtimeClass: gvisor, worktrees: per-source }
@@ -254,10 +257,8 @@ spec:
     #[test]
     fn sample_cr_round_trips() {
         let task: CalibanTask = serde_norway::from_str(SAMPLE).expect("deserialize sample");
-        assert_eq!(task.spec.workspace.sources.len(), 2);
-        assert_eq!(task.spec.workspace.sources[0].name, "caliban");
-        assert_eq!(task.spec.workspace.sources[1].r#ref, "feat-xport");
-        assert_eq!(task.spec.workspace.services, vec!["gonzalod", "prosperod"]);
+        assert_eq!(task.spec.workspace_ref.name, "team-a-ws");
+        assert_eq!(task.spec.provider_ref.as_deref(), Some("planner"));
         assert_eq!(task.spec.task.prompt, "refactor the auth module");
         assert_eq!(
             task.spec.task.agent_type.as_deref(),
@@ -281,6 +282,10 @@ spec:
         let json = serde_json::to_value(&task.spec).unwrap();
         assert!(
             json["task"]["agentType"].is_string(),
+            "camelCase key expected"
+        );
+        assert!(
+            json["workspaceRef"]["name"].is_string(),
             "camelCase key expected"
         );
     }
@@ -313,26 +318,18 @@ spec:
 
     #[test]
     fn crd_enforces_non_empty_required_fields() {
-        // Semantically-invalid CRs (`sources: []`, `prompt: ""`) must be rejected
-        // by the API server, not admitted and set to Pending. The generated CRD
-        // schema carries the constraints (schemars `length(min = 1)`).
+        // Semantically-invalid CRs (`workspaceRef.name: ""`, `prompt: ""`) must be
+        // rejected by the API server, not admitted and set to Pending. The
+        // generated CRD schema carries the constraints (schemars `length(min = 1)`).
+        // (The `sources` constraint now lives on the Workspace CRD; see workspace.rs.)
         let crd = CalibanTask::crd();
         let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
         let spec = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"];
 
-        // sources: at least one checkout.
         assert_eq!(
-            spec["workspace"]["properties"]["sources"]["minItems"], 1,
-            "workspace.sources must require minItems: 1"
+            spec["workspaceRef"]["properties"]["name"]["minLength"], 1,
+            "workspaceRef.name must require minLength: 1"
         );
-        // Required strings: no empty values.
-        let source_props = &spec["workspace"]["properties"]["sources"]["items"]["properties"];
-        for field in ["name", "repo", "path"] {
-            assert_eq!(
-                source_props[field]["minLength"], 1,
-                "source.{field} must require minLength: 1"
-            );
-        }
         assert_eq!(
             spec["task"]["properties"]["prompt"]["minLength"], 1,
             "task.prompt must require minLength: 1"
@@ -347,13 +344,14 @@ apiVersion: caliban.caliban-ai.dev/v1alpha1
 kind: CalibanTask
 metadata: { name: m, namespace: n }
 spec:
-  workspace: { sources: [ { name: only, repo: "git@x:only", path: /work/only } ] }
+  workspaceRef: { name: only-ws }
   task: { prompt: hi }
 "#;
         let task: CalibanTask = serde_norway::from_str(yaml).unwrap();
-        assert_eq!(task.spec.workspace.sources[0].r#ref, "main"); // default ref
-        assert!(task.spec.workspace.services.is_empty());
+        assert_eq!(task.spec.workspace_ref.name, "only-ws");
+        assert!(task.spec.provider_ref.is_none());
         assert!(task.spec.model.is_none());
         assert!(task.spec.task.agent_type.is_none());
+        assert!(task.spec.tools.is_none());
     }
 }

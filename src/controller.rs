@@ -19,6 +19,8 @@ use crate::config::{sandbox_name, Settings};
 use crate::crd::{CalibanTask, CalibanTaskStatus, NamedRef, Phase};
 use crate::resources::plan;
 use crate::sandbox::Sandbox;
+use crate::workspace::resolve_workspace;
+use crate::workspace::Workspace;
 
 /// Controller error.
 #[derive(thiserror::Error, Debug)]
@@ -89,7 +91,54 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
     let ns = obj.namespace().unwrap_or_default();
     let name = obj.name_any();
     let s = &ctx.settings;
-    let p = plan(&obj, s);
+
+    // Pin once: a running task keeps the config it was admitted with. Later
+    // edits to the referenced `Workspace` don't re-pin (or disturb) a running task.
+    let resolved = match obj
+        .status
+        .as_ref()
+        .and_then(|st| st.resolved_workspace.clone())
+    {
+        Some(rw) => rw,
+        None => {
+            let ws_api: Api<Workspace> = Api::namespaced(ctx.client.clone(), &ns);
+            let ws = ws_api.get_opt(&obj.spec.workspace_ref.name).await?;
+            match ws.and_then(|w| resolve_workspace(&w.spec, obj.spec.provider_ref.as_deref()).ok())
+            {
+                Some(rw) => {
+                    // Persist the pin immediately so it's stable for the run.
+                    // Also clear any stale `WorkspaceUnresolved` condition left
+                    // by a prior fail-fast reconcile: `derive_status` never
+                    // touches `conditions`, so without this the recovered task
+                    // would carry a permanent Ready=False alongside a healthy
+                    // phase.
+                    let patch = serde_json::json!({
+                        "status": { "resolvedWorkspace": rw, "conditions": [] }
+                    });
+                    let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
+                    task_api
+                        .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+                        .await?;
+                    rw
+                }
+                None => {
+                    let patch = serde_json::json!({
+                        "status": { "phase": Phase::Failed,
+                            "conditions": [{ "type": "Ready", "status": "False",
+                                "reason": "WorkspaceUnresolved",
+                                "message": format!("workspaceRef '{}' / providerRef unresolved", obj.spec.workspace_ref.name) }] }
+                    });
+                    let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
+                    task_api
+                        .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
+                        .await?;
+                    tracing::warn!(%ns, %name, "workspace unresolved; task Failed");
+                    return Ok(Action::requeue(Duration::from_secs(30)));
+                }
+            }
+        }
+    };
+    let p = plan(&obj, &resolved, s);
 
     // Apply children (idempotent SSA; owner refs cascade-delete).
     let sa_api: Api<ServiceAccount> = Api::namespaced(ctx.client.clone(), &ns);
@@ -143,7 +192,7 @@ pub async fn run(client: Client) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{CalibanTaskSpec, Source, TaskSpec, Workspace};
+    use crate::crd::{CalibanTaskSpec, TaskSpec, WorkspaceRef};
     use crate::sandbox::{SandboxSpec, SandboxStatus};
     use k8s_openapi::api::core::v1::PodTemplateSpec;
 
@@ -151,15 +200,10 @@ mod tests {
         let mut t = CalibanTask::new(
             "refactor-auth",
             CalibanTaskSpec {
-                workspace: Workspace {
-                    sources: vec![Source {
-                        name: "caliban".into(),
-                        repo: "git@x:caliban".into(),
-                        r#ref: "main".into(),
-                        path: "/work/caliban".into(),
-                    }],
-                    services: vec![],
+                workspace_ref: WorkspaceRef {
+                    name: "team-a-ws".into(),
                 },
+                provider_ref: None,
                 task: TaskSpec {
                     prompt: "hi".into(),
                     agent_type: None,
@@ -169,6 +213,7 @@ mod tests {
                 isolation: None,
                 resources: None,
                 lifecycle: None,
+                tools: None,
             },
         );
         t.metadata.namespace = Some("team-a".into());
