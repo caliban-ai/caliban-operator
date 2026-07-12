@@ -463,4 +463,18 @@ spec:
         let err = resolve_workspace(&spec, Some("nope")).unwrap_err();
         assert_eq!(err, "providerRef 'nope' names no provider in the workspace");
     }
+
+    #[test]
+    fn sample_manifests_deserialize() {
+        let ws: Workspace =
+            serde_norway::from_str(include_str!("../deploy/samples/workspace.yaml")).unwrap();
+        assert_eq!(ws.spec.providers.len(), 2);
+        let ct: crate::crd::CalibanTask =
+            serde_norway::from_str(include_str!("../deploy/samples/calibantask.yaml")).unwrap();
+        assert_eq!(ct.spec.workspace_ref.name, "team-a-ws");
+        assert_eq!(ct.spec.provider_ref.as_deref(), Some("workers"));
+        // The sample CalibanTask references a provider the sample Workspace defines.
+        let r = resolve_workspace(&ws.spec, ct.spec.provider_ref.as_deref()).unwrap();
+        assert_eq!(r.provider.kind, "ollama");
+    }
 }
