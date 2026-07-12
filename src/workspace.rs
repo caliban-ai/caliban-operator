@@ -114,8 +114,6 @@ pub enum WorkspacePhase {
     /// Created, not yet reconciled.
     #[default]
     Pending,
-    /// Reconcile in progress.
-    Reconciling,
     /// Valid — all providers and credential Secrets resolve.
     Ready,
     /// Invalid — see `message`.

@@ -188,7 +188,6 @@ spec:
                 description: Lifecycle phase.
                 enum:
                 - Pending
-                - Reconciling
                 - Ready
                 - Failed
                 type: string
