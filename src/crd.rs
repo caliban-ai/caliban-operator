@@ -173,7 +173,15 @@ pub struct CalibanTaskStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceStatus>,
     /// Standard Kubernetes conditions.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    // No `skip_serializing_if` here either (see `caliband_endpoint` above):
+    // `derive_status` sets this to `[]` to clear a stale `Ready` condition
+    // when the phase leaves `Running`. Under JSON Merge Patch, an *omitted*
+    // key is left unchanged server-side, so an empty `Vec` must still
+    // serialize as `"conditions": []` — skipping it here would leave the
+    // stale condition on the server forever (and cause endless reconcile
+    // churn, since the next read would keep disagreeing with what
+    // `derive_status` recomputes).
+    #[serde(default)]
     pub conditions: Vec<Condition>,
     /// Resolved workspace config, pinned at admission (immutable run). Set once;
     /// later `Workspace` edits don't re-pin a running task.

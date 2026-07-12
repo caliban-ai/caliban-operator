@@ -368,5 +368,12 @@ mod tests {
         // Merge-patch needs explicit null (not absent) to delete the stale values.
         assert!(v.get("calibandEndpoint").is_some_and(|x| x.is_null()));
         assert!(v.get("sandboxRef").is_some_and(|x| x.is_null()));
+        // Regression guard: a Running->Pending transition must serialize
+        // `conditions` as an explicit empty array, not omit the key. Under
+        // JSON Merge Patch an omitted key is left unchanged server-side, so
+        // if `conditions` were skipped here the stale `Ready=True` condition
+        // would never be cleared and every subsequent reconcile would keep
+        // re-patching (endless churn).
+        assert_eq!(v.get("conditions"), Some(&serde_json::json!([])));
     }
 }

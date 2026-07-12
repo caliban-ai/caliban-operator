@@ -138,6 +138,7 @@ spec:
                 nullable: true
                 type: string
               conditions:
+                default: []
                 description: Standard Kubernetes conditions.
                 items:
                   description: A minimal Kubernetes-style condition.
