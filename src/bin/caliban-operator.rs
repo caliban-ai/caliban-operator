@@ -8,5 +8,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("caliban-operator starting");
     let client = kube::Client::try_default().await?;
     tracing::info!("connected to the Kubernetes API");
-    caliban_operator::controller::run(client).await
+    tokio::try_join!(
+        caliban_operator::controller::run(client.clone()),
+        caliban_operator::workspace_controller::run(client),
+    )?;
+    Ok(())
 }
