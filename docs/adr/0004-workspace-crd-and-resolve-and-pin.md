@@ -56,8 +56,9 @@ Forces:
    (the git checkouts), a **named** `providers` list (each `{name, kind, baseUrl,
    model, credentialsRef}` — a `credentialsRef` is a by-name Secret+key reference,
    never a value), an optional `defaultProvider`, non-secret `env`, and default
-   `isolation`. `WorkspaceStatus` carries `phase` (`Pending → Reconciling → Ready |
-   Failed`), `conditions`, `observedGeneration`, and a human-readable `message`. The
+   `isolation`. `WorkspaceStatus` carries `phase` (`Pending → Ready | Failed` —
+   validation is synchronous, so there is no observable intermediate reconciling
+   state), `conditions`, `observedGeneration`, and a human-readable `message`. The
    CRD YAML is generated from the Rust types and golden-tested in sync, per ADR
    0001's discipline.
 
