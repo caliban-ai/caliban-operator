@@ -658,6 +658,10 @@ mod tests {
             .unwrap();
         assert_eq!(sel.name, "caliban-session-plane-token");
         assert_eq!(sel.key, "token");
+        assert!(
+            tok.value.is_none(),
+            "token must never be inlined as plaintext"
+        );
 
         // TLS Secret mounted read-only at the expected path.
         let mount = c
