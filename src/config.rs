@@ -21,6 +21,12 @@ pub struct Settings {
     pub workspace_storage: String,
     /// Container image for the git-clone init container that populates the workspace.
     pub git_image: String,
+    /// Name of the shared TLS serving-cert Secret (keys tls.crt/tls.key/ca.crt).
+    pub session_tls_secret: String,
+    /// Name of the shared bearer-token Secret.
+    pub session_token_secret: String,
+    /// Key within the token Secret.
+    pub session_token_key: String,
 }
 
 impl Default for Settings {
@@ -31,13 +37,17 @@ impl Default for Settings {
             workspace_root: "/work".to_string(),
             workspace_storage: "10Gi".to_string(),
             git_image: "alpine/git:latest".to_string(),
+            session_tls_secret: "caliban-session-plane-tls".to_string(),
+            session_token_secret: "caliban-session-plane-token".to_string(),
+            session_token_key: "token".to_string(),
         }
     }
 }
 
 impl Settings {
     /// Read settings from `CALIBAND_IMAGE`, `CALIBAND_PORT`, `CALIBAN_WORKSPACE_ROOT`,
-    /// `CALIBAN_WORKSPACE_STORAGE`, `CALIBAN_GIT_IMAGE`, falling back to defaults.
+    /// `CALIBAN_WORKSPACE_STORAGE`, `CALIBAN_GIT_IMAGE`, `CALIBAN_SESSION_TLS_SECRET`,
+    /// `CALIBAN_SESSION_TOKEN_SECRET`, `CALIBAN_SESSION_TOKEN_KEY`, falling back to defaults.
     pub fn from_env() -> Self {
         let d = Self::default();
         Self {
@@ -50,6 +60,12 @@ impl Settings {
             workspace_storage: std::env::var("CALIBAN_WORKSPACE_STORAGE")
                 .unwrap_or(d.workspace_storage),
             git_image: std::env::var("CALIBAN_GIT_IMAGE").unwrap_or(d.git_image),
+            session_tls_secret: std::env::var("CALIBAN_SESSION_TLS_SECRET")
+                .unwrap_or(d.session_tls_secret),
+            session_token_secret: std::env::var("CALIBAN_SESSION_TOKEN_SECRET")
+                .unwrap_or(d.session_token_secret),
+            session_token_key: std::env::var("CALIBAN_SESSION_TOKEN_KEY")
+                .unwrap_or(d.session_token_key),
         }
     }
 }
@@ -146,5 +162,13 @@ mod tests {
         assert_eq!(s.workspace_root, "/work");
         assert!(!s.git_image.contains("home"));
         assert!(!s.git_image.is_empty());
+    }
+
+    #[test]
+    fn session_plane_defaults_match_the_shared_secret_names() {
+        let s = Settings::default();
+        assert_eq!(s.session_tls_secret, "caliban-session-plane-tls");
+        assert_eq!(s.session_token_secret, "caliban-session-plane-token");
+        assert_eq!(s.session_token_key, "token");
     }
 }
