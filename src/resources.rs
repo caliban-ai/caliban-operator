@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, EnvVarSource, PersistentVolumeClaimSpec, PodSpec,
-    PodTemplateSpec, SecretKeySelector, ServiceAccount, VolumeMount, VolumeResourceRequirements,
+    PodTemplateSpec, SecretKeySelector, SecretVolumeSource, ServiceAccount, Volume, VolumeMount,
+    VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -211,6 +212,9 @@ fn workspace_pvc(s: &Settings) -> VolumeClaimTemplate {
 /// Map a `CalibanTask` + its resolved workspace to the backing agent-sandbox
 /// `Sandbox`.
 pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> Sandbox {
+    const TLS_MOUNT: &str = "/etc/caliband/tls";
+    const TLS_VOLUME: &str = "session-tls";
+
     let labels = common_labels(t);
     let container = Container {
         name: "caliband".to_string(),
@@ -225,13 +229,40 @@ pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> S
             s.workspace_root.clone(),
             "--listen".to_string(),
             format!("0.0.0.0:{}", s.caliband_port),
+            "--tls-cert".to_string(),
+            format!("{TLS_MOUNT}/tls.crt"),
+            "--tls-key".to_string(),
+            format!("{TLS_MOUNT}/tls.key"),
         ]),
-        env: Some(caliband_env(t, rw)),
-        volume_mounts: Some(vec![VolumeMount {
-            name: WORKSPACE_VOLUME.to_string(),
-            mount_path: s.workspace_root.clone(),
-            ..Default::default()
-        }]),
+        env: Some({
+            let mut e = caliband_env(t, rw);
+            e.push(EnvVar {
+                name: "CALIBAN_DAEMON_TOKEN".to_string(),
+                value: None,
+                value_from: Some(EnvVarSource {
+                    secret_key_ref: Some(SecretKeySelector {
+                        name: s.session_token_secret.clone(),
+                        key: s.session_token_key.clone(),
+                        optional: Some(false),
+                    }),
+                    ..Default::default()
+                }),
+            });
+            e
+        }),
+        volume_mounts: Some(vec![
+            VolumeMount {
+                name: WORKSPACE_VOLUME.to_string(),
+                mount_path: s.workspace_root.clone(),
+                ..Default::default()
+            },
+            VolumeMount {
+                name: TLS_VOLUME.to_string(),
+                mount_path: TLS_MOUNT.to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            },
+        ]),
         ..Default::default()
     };
     let pod_spec = PodSpec {
@@ -246,6 +277,14 @@ pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> S
             .or_else(|| rw.isolation.as_ref().and_then(|i| i.runtime_class.clone())),
         service_account_name: Some(sa_name(t)),
         automount_service_account_token: Some(false),
+        volumes: Some(vec![Volume {
+            name: TLS_VOLUME.to_string(),
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(s.session_tls_secret.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]),
         ..Default::default()
     };
     let mut sb = Sandbox::new(
@@ -582,6 +621,68 @@ mod tests {
         assert!(env
             .iter()
             .any(|e| e.name == "FOO" && e.value.as_deref() == Some("bar")));
+    }
+
+    #[test]
+    fn sandbox_wires_session_plane_tls_and_token() {
+        let s = Settings::default();
+        let sb = build_sandbox(&task(), &resolved(), &s);
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let c = &pod.containers[0];
+
+        // TLS args present and pointing at the mounted files.
+        let args = c.args.as_ref().unwrap();
+        let cert_idx = args
+            .iter()
+            .position(|a| a == "--tls-cert")
+            .expect("--tls-cert");
+        assert_eq!(args[cert_idx + 1], "/etc/caliband/tls/tls.crt");
+        let key_idx = args
+            .iter()
+            .position(|a| a == "--tls-key")
+            .expect("--tls-key");
+        assert_eq!(args[key_idx + 1], "/etc/caliband/tls/tls.key");
+
+        // Bearer token injected by reference (never inlined).
+        let env = c.env.as_ref().unwrap();
+        let tok = env
+            .iter()
+            .find(|e| e.name == "CALIBAN_DAEMON_TOKEN")
+            .expect("token env");
+        let sel = tok
+            .value_from
+            .as_ref()
+            .unwrap()
+            .secret_key_ref
+            .as_ref()
+            .unwrap();
+        assert_eq!(sel.name, "caliban-session-plane-token");
+        assert_eq!(sel.key, "token");
+        assert!(
+            tok.value.is_none(),
+            "token must never be inlined as plaintext"
+        );
+
+        // TLS Secret mounted read-only at the expected path.
+        let mount = c
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.mount_path == "/etc/caliband/tls")
+            .expect("tls mount");
+        assert_eq!(mount.read_only, Some(true));
+        let vol = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == mount.name)
+            .expect("tls volume");
+        assert_eq!(
+            vol.secret.as_ref().unwrap().secret_name.as_deref(),
+            Some("caliban-session-plane-tls")
+        );
     }
 
     #[test]
