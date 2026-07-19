@@ -62,10 +62,12 @@ the caliban image's Dockerfile:
 - **The init container needs a git image and egress** to clone sources — the ADR 0002
   NetworkPolicy already allows general egress. Private sources will need credential
   projection (deferred).
-- **`advertise-host` / per-agent ports are not yet set.** Control-plane reachability
-  (`serviceFQDN:<port>`) works; per-agent attach dialing from outside the pod (prospero's
-  session plane) needs `--advertise-host <serviceFQDN>` + per-agent port routing — a
-  follow-up paired with prospero #77.
+- **`advertise-host` / per-agent ports** — _resolved (#24/#25)._ Control-plane
+  reachability (`serviceFQDN:<port>`) worked, but per-agent attach dialing from outside
+  the pod (prospero's session plane) needed `--advertise-host <serviceFQDN>` + per-agent
+  port routing. `build_sandbox` now passes `--advertise-host <sandbox>.<ns>.svc.cluster.local`
+  and pins `--agent-port-base`, and the NetworkPolicy opens the matching per-agent stream
+  window alongside the control port.
 - **`git clone --depth 1 --branch <ref>` accepts branch/tag names only, not commit
   SHAs** — a `ref` set to a raw commit SHA will fail the clone (the CRD's `ref` defaults
   to `main`; SHA-pinning is a follow-up).

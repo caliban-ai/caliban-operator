@@ -15,6 +15,10 @@ pub struct Settings {
     pub caliband_image: String,
     /// TCP+TLS port caliband listens on inside the pod.
     pub caliband_port: i32,
+    /// Base port caliband draws per-agent stream listeners from (monotonic).
+    pub agent_port_base: i32,
+    /// Top of the per-agent stream port window the NetworkPolicy opens (inclusive).
+    pub agent_port_end: i32,
     /// Workspace root mount path in the pod.
     pub workspace_root: String,
     /// Requested size of the workspace PVC (e.g. `10Gi`).
@@ -34,6 +38,8 @@ impl Default for Settings {
         Self {
             caliband_image: "ghcr.io/caliban-ai/caliban:latest".to_string(),
             caliband_port: 8443,
+            agent_port_base: 7100,
+            agent_port_end: 7999,
             workspace_root: "/work".to_string(),
             workspace_storage: "10Gi".to_string(),
             git_image: "alpine/git:latest".to_string(),
@@ -45,9 +51,10 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Read settings from `CALIBAND_IMAGE`, `CALIBAND_PORT`, `CALIBAN_WORKSPACE_ROOT`,
-    /// `CALIBAN_WORKSPACE_STORAGE`, `CALIBAN_GIT_IMAGE`, `CALIBAN_SESSION_TLS_SECRET`,
-    /// `CALIBAN_SESSION_TOKEN_SECRET`, `CALIBAN_SESSION_TOKEN_KEY`, falling back to defaults.
+    /// Read settings from `CALIBAND_IMAGE`, `CALIBAND_PORT`, `CALIBAN_AGENT_PORT_BASE`,
+    /// `CALIBAN_AGENT_PORT_END`, `CALIBAN_WORKSPACE_ROOT`, `CALIBAN_WORKSPACE_STORAGE`,
+    /// `CALIBAN_GIT_IMAGE`, `CALIBAN_SESSION_TLS_SECRET`, `CALIBAN_SESSION_TOKEN_SECRET`,
+    /// `CALIBAN_SESSION_TOKEN_KEY`, falling back to defaults.
     pub fn from_env() -> Self {
         let d = Self::default();
         Self {
@@ -56,6 +63,14 @@ impl Settings {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d.caliband_port),
+            agent_port_base: std::env::var("CALIBAN_AGENT_PORT_BASE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.agent_port_base),
+            agent_port_end: std::env::var("CALIBAN_AGENT_PORT_END")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.agent_port_end),
             workspace_root: std::env::var("CALIBAN_WORKSPACE_ROOT").unwrap_or(d.workspace_root),
             workspace_storage: std::env::var("CALIBAN_WORKSPACE_STORAGE")
                 .unwrap_or(d.workspace_storage),
@@ -81,6 +96,17 @@ pub fn sa_name(t: &CalibanTask) -> String {
 /// Name of the task's NetworkPolicy.
 pub fn netpol_name(t: &CalibanTask) -> String {
     format!("{}-netpol", t.name_any())
+}
+
+/// In-cluster DNS caliband advertises for its per-agent stream endpoints: the
+/// Sandbox's headless service FQDN. caliband otherwise advertises its `0.0.0.0`
+/// bind address, which prosperod cannot reach (#24).
+pub fn caliband_advertise_host(t: &CalibanTask) -> String {
+    format!(
+        "{}.{}.svc.cluster.local",
+        sandbox_name(t),
+        t.namespace().unwrap_or_default()
+    )
 }
 
 /// Labels stamped on every child object, keyed to the owning task.
@@ -170,5 +196,25 @@ mod tests {
         assert_eq!(s.session_tls_secret, "caliban-session-plane-tls");
         assert_eq!(s.session_token_secret, "caliban-session-plane-token");
         assert_eq!(s.session_token_key, "token");
+    }
+
+    #[test]
+    fn agent_port_defaults_open_the_per_agent_window() {
+        let s = Settings::default();
+        // caliband draws per-agent stream ports monotonically from this base (#24/#25).
+        assert_eq!(s.agent_port_base, 7100);
+        // The NetworkPolicy opens [base, end]; 7999 leaves 900 spawns of headroom.
+        assert_eq!(s.agent_port_end, 7999);
+    }
+
+    #[test]
+    fn caliband_advertise_host_is_the_sandbox_service_fqdn() {
+        // The routable host prosperod dials for a per-agent stream: the Sandbox's
+        // in-cluster service DNS, not caliband's 0.0.0.0 bind address (#24).
+        let t = task();
+        assert_eq!(
+            caliband_advertise_host(&t),
+            "refactor-auth-sbx.team-a.svc.cluster.local"
+        );
     }
 }

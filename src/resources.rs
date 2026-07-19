@@ -18,7 +18,9 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::ResourceExt;
 
-use crate::config::{common_labels, netpol_name, owner_ref, sa_name, sandbox_name, Settings};
+use crate::config::{
+    caliband_advertise_host, common_labels, netpol_name, owner_ref, sa_name, sandbox_name, Settings,
+};
 use crate::crd::CalibanTask;
 use crate::sandbox::{Sandbox, SandboxSpec, VolumeClaimTemplate};
 use crate::workspace::{ResolvedProvider, ResolvedWorkspace};
@@ -50,6 +52,15 @@ fn np_port(proto: &str, port: i32) -> NetworkPolicyPort {
     }
 }
 
+/// A `[start, end]` inclusive port range (for caliband's per-agent stream window).
+fn np_port_range(proto: &str, start: i32, end: i32) -> NetworkPolicyPort {
+    NetworkPolicyPort {
+        protocol: Some(proto.to_string()),
+        port: Some(IntOrString::Int(start)),
+        end_port: Some(end),
+    }
+}
+
 /// Default-deny NetworkPolicy: allow DNS + general egress + caliband-port ingress.
 pub fn build_network_policy(t: &CalibanTask, s: &Settings) -> NetworkPolicy {
     NetworkPolicy {
@@ -61,9 +72,14 @@ pub fn build_network_policy(t: &CalibanTask, s: &Settings) -> NetworkPolicy {
                 ..Default::default()
             }),
             policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
-            // Ingress: caliband port only.
+            // Ingress: the caliband control port plus the per-agent stream window
+            // prosperod dials once it resolves an agent's endpoint (#25). Without
+            // the range, the stream dial is blocked even with a routable host.
             ingress: Some(vec![NetworkPolicyIngressRule {
-                ports: Some(vec![np_port("TCP", s.caliband_port)]),
+                ports: Some(vec![
+                    np_port("TCP", s.caliband_port),
+                    np_port_range("TCP", s.agent_port_base, s.agent_port_end),
+                ]),
                 from: Some(vec![NetworkPolicyPeer {
                     pod_selector: Some(LabelSelector::default()),
                     ..Default::default()
@@ -229,6 +245,14 @@ pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> S
             s.workspace_root.clone(),
             "--listen".to_string(),
             format!("0.0.0.0:{}", s.caliband_port),
+            // Advertise the pod's routable DNS (not the 0.0.0.0 bind) so prosperod
+            // can reach the per-agent stream endpoints caliband hands out (#24).
+            "--advertise-host".to_string(),
+            caliband_advertise_host(t),
+            // Pin the per-agent port base so it stays locked to the window the
+            // NetworkPolicy opens (#25) — the operator is the single source of truth.
+            "--agent-port-base".to_string(),
+            s.agent_port_base.to_string(),
             "--tls-cert".to_string(),
             format!("{TLS_MOUNT}/tls.crt"),
             "--tls-key".to_string(),
@@ -419,6 +443,47 @@ mod tests {
             .match_labels
             .unwrap()
             .contains_key("caliban.caliban-ai.dev/task"));
+    }
+
+    #[test]
+    fn network_policy_opens_the_per_agent_stream_port_range() {
+        // #25: prosperod's per-agent stream dial targets a port drawn from the
+        // agent-port-base (7100) upward, which the old policy (8443-only) blocked.
+        let np = build_network_policy(&task(), &Settings::default());
+        let ingress = np.spec.unwrap().ingress.unwrap();
+        let ports = ingress[0].ports.clone().unwrap();
+        // The caliband control port is still allowed as a single port.
+        assert!(ports
+            .iter()
+            .any(|p| p.port == Some(IntOrString::Int(8443)) && p.end_port.is_none()));
+        // The per-agent stream window 7100..=7999 is allowed as a range.
+        assert!(ports
+            .iter()
+            .any(|p| p.port == Some(IntOrString::Int(7100)) && p.end_port == Some(7999)));
+    }
+
+    #[test]
+    fn sandbox_advertises_routable_host_and_pins_agent_port_base() {
+        let s = Settings::default();
+        let sb = build_sandbox(&task(), &resolved(), &s);
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let args = pod.containers[0].args.as_ref().unwrap();
+        // #24: caliband advertises the pod's routable DNS for per-agent endpoints,
+        // not its 0.0.0.0 bind address.
+        let adv_idx = args
+            .iter()
+            .position(|a| a == "--advertise-host")
+            .expect("--advertise-host flag present");
+        assert_eq!(
+            args[adv_idx + 1],
+            "refactor-auth-sbx.team-a.svc.cluster.local"
+        );
+        // The operator pins the port base so it stays locked to the NetworkPolicy window.
+        let base_idx = args
+            .iter()
+            .position(|a| a == "--agent-port-base")
+            .expect("--agent-port-base flag present");
+        assert_eq!(args[base_idx + 1], "7100");
     }
 
     #[test]
