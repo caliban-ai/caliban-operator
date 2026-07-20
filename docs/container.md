@@ -16,8 +16,9 @@ A two-stage build (`Dockerfile`):
 
 The image contains only the controller (`caliban-operator`), not the `crdgen`
 dev tool. Configuration is entirely via environment (`RUST_LOG`, `CALIBAND_IMAGE`,
-`CALIBAND_PORT`, `CALIBAN_WORKSPACE_ROOT`, `CALIBAN_WORKSPACE_STORAGE`,
-`CALIBAN_GIT_IMAGE`) — see the `caliban-operator` Helm chart.
+`CALIBAND_PORT`, `CALIBAN_AGENT_PORT_BASE`, `CALIBAN_AGENT_PORT_END`,
+`CALIBAN_WORKSPACE_ROOT`, `CALIBAN_WORKSPACE_STORAGE`, `CALIBAN_GIT_IMAGE`)
+— see the `caliban-operator` Helm chart.
 
 ## Build locally
 
