@@ -98,6 +98,14 @@ spec:
                     description: Agent type (e.g. `general-purpose`).
                     nullable: true
                     type: string
+                  interactive:
+                    description: |-
+                      Run the agent in interactive mode: it awaits operator input at each
+                      end-of-run instead of finishing. The operator only carries this through
+                      to the CR — prospero reads it back and sets `SpawnSpec.interactive` on
+                      the pod caliband itself (prospero#163).
+                    nullable: true
+                    type: boolean
                   prompt:
                     description: Initial prompt.
                     minLength: 1

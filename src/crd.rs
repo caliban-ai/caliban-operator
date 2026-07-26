@@ -88,6 +88,12 @@ pub struct TaskSpec {
     /// Agent type (e.g. `general-purpose`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
+    /// Run the agent in interactive mode: it awaits operator input at each
+    /// end-of-run instead of finishing. The operator only carries this through
+    /// to the CR — prospero reads it back and sets `SpawnSpec.interactive` on
+    /// the pod caliband itself (prospero#163).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive: Option<bool>,
 }
 
 /// Model-router configuration.
@@ -330,6 +336,64 @@ spec:
             spec["task"]["properties"]["prompt"]["minLength"], 1,
             "task.prompt must require minLength: 1"
         );
+    }
+
+    #[test]
+    fn crd_schema_exposes_task_interactive_as_boolean() {
+        // prospero projects `SpawnRequest.interactive` onto this field and reads
+        // it back in `spawn_spec_from_task`; without it the flag is dropped at
+        // the CR boundary and a k8s agent can never await input (prospero#163).
+        let crd = CalibanTask::crd();
+        let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
+        let task = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"]["task"];
+
+        assert_eq!(
+            task["properties"]["interactive"]["type"], "boolean",
+            "task.interactive must be a boolean in the generated schema"
+        );
+        assert!(
+            !task["required"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|f| f == "interactive")),
+            "task.interactive must stay optional so existing CRs remain valid"
+        );
+    }
+
+    #[test]
+    fn cr_without_interactive_deserializes_to_none() {
+        // Back-compat: every CalibanTask written before this field existed must
+        // still apply unchanged.
+        let yaml = r#"
+apiVersion: caliban.caliban-ai.dev/v1alpha1
+kind: CalibanTask
+metadata: { name: m, namespace: n }
+spec:
+  workspaceRef: { name: only-ws }
+  task: { prompt: hi }
+"#;
+        let task: CalibanTask = serde_norway::from_str(yaml).unwrap();
+        assert!(
+            task.spec.task.interactive.is_none(),
+            "an absent interactive field must deserialize to None, not error"
+        );
+    }
+
+    #[test]
+    fn cr_with_interactive_true_round_trips() {
+        let yaml = r#"
+apiVersion: caliban.caliban-ai.dev/v1alpha1
+kind: CalibanTask
+metadata: { name: m, namespace: n }
+spec:
+  workspaceRef: { name: only-ws }
+  task: { prompt: hi, interactive: true }
+"#;
+        let task: CalibanTask = serde_norway::from_str(yaml).unwrap();
+        assert_eq!(task.spec.task.interactive, Some(true));
+
+        // camelCase key survives re-serialization (prospero reads it back).
+        let json = serde_json::to_value(&task.spec).unwrap();
+        assert_eq!(json["task"]["interactive"], serde_json::json!(true));
     }
 
     #[test]

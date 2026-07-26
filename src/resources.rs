@@ -367,6 +367,7 @@ mod tests {
                 task: TaskSpec {
                     prompt: "hi".into(),
                     agent_type: None,
+                    interactive: None,
                 },
                 model: None,
                 state: None,
