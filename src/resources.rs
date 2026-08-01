@@ -132,19 +132,46 @@ fn caliband_env(t: &CalibanTask, rw: &ResolvedWorkspace) -> Vec<EnvVar> {
     e
 }
 
+/// The env-name prefix caliban reads for a provider kind — the `{PROVIDER}` in
+/// `{PROVIDER}_BASE_URL` / `{PROVIDER}_API_KEY` (#30, caliban#390's acceptance).
+///
+/// Uppercasing the kind is right for `anthropic`, `openai` and `ollama`, but
+/// two kinds are irregular on caliban's side and must be aliased explicitly:
+/// its google provider reads the `GEMINI_*` pair, and its Azure path reads
+/// `AZURE_OPENAI_*`. An unknown kind falls back to the uppercase form, which is
+/// the convention every provider crate follows.
+fn provider_env_prefix(kind: &str) -> String {
+    match kind.to_ascii_lowercase().as_str() {
+        "google" | "gemini" => "GEMINI".to_string(),
+        "azure" | "azure-openai" | "azure_openai" => "AZURE_OPENAI".to_string(),
+        other => other.to_ascii_uppercase().replace(['-', '.'], "_"),
+    }
+}
+
 /// Project a resolved provider to caliband container env. Credentials reach the
 /// pod via `secretKeyRef` (the operator never inlines the value).
+///
+/// Base URL and API key are projected under **provider-native** names (#30).
+/// caliban implements no `CALIBAN_*` namespace for these: it reads
+/// `OLLAMA_BASE_URL`, `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`, and so on.
+/// Projecting `CALIBAN_PROVIDER_BASE_URL` / `CALIBAN_API_KEY` silently dropped
+/// both the endpoint and the credential — the pod looked correctly configured
+/// while the agent could reach nothing.
+///
+/// `CALIBAN_MODEL` is not projected at all: caliban never reads it, and the
+/// model reaches the worker through caliband's `SpawnSpec` (prospero#168).
+/// `CALIBAN_PROVIDER` *is* still projected — not as a provider selector
+/// (caliban#93 verified it is not one; selection travels in the `SpawnSpec`)
+/// but because it is the documented input to a user-configured `apiKeyHelper`.
 pub(crate) fn provider_env(rp: &ResolvedProvider) -> Vec<EnvVar> {
+    let prefix = provider_env_prefix(&rp.kind);
     let mut e = vec![env("CALIBAN_PROVIDER", rp.kind.clone())];
     if let Some(u) = &rp.base_url {
-        e.push(env("CALIBAN_PROVIDER_BASE_URL", u.clone()));
-    }
-    if let Some(m) = &rp.model {
-        e.push(env("CALIBAN_MODEL", m.clone()));
+        e.push(env(&format!("{prefix}_BASE_URL"), u.clone()));
     }
     if let Some(c) = &rp.credentials_ref {
         e.push(EnvVar {
-            name: "CALIBAN_API_KEY".to_string(),
+            name: format!("{prefix}_API_KEY"),
             value: None,
             value_from: Some(EnvVarSource {
                 secret_key_ref: Some(SecretKeySelector {
@@ -768,8 +795,13 @@ mod tests {
         );
     }
 
+    /// #30: caliban reads **provider-native** env names — `ANTHROPIC_BASE_URL`
+    /// / `ANTHROPIC_API_KEY` for anthropic, and so on. It reads no
+    /// `CALIBAN_PROVIDER_BASE_URL` or `CALIBAN_API_KEY` at all, so projecting
+    /// under those names silently dropped both the endpoint and the credential.
+    /// caliban#390's acceptance already specified `{PROVIDER}_BASE_URL`.
     #[test]
-    fn provider_env_projects_kind_url_model_and_secret_ref() {
+    fn provider_env_projects_base_url_and_key_under_provider_native_names() {
         use crate::workspace::{CredentialsRef, ResolvedProvider};
         let rp = ResolvedProvider {
             name: "planner".into(),
@@ -783,24 +815,77 @@ mod tests {
         };
         let env = provider_env(&rp);
         let get = |n: &str| env.iter().find(|e| e.name == n).cloned();
+
         assert_eq!(
-            get("CALIBAN_PROVIDER").unwrap().value.as_deref(),
-            Some("anthropic")
-        );
-        assert_eq!(
-            get("CALIBAN_PROVIDER_BASE_URL").unwrap().value.as_deref(),
-            Some("https://api.anthropic.com")
-        );
-        assert_eq!(
-            get("CALIBAN_MODEL").unwrap().value.as_deref(),
-            Some("claude-opus-4-8")
+            get("ANTHROPIC_BASE_URL").unwrap().value.as_deref(),
+            Some("https://api.anthropic.com"),
+            "the base URL must land on the name caliban actually reads"
         );
         // Secret reaches the pod by reference, never inlined.
-        let key = get("CALIBAN_API_KEY").unwrap();
+        let key = get("ANTHROPIC_API_KEY").expect("keyed provider projects its native API key env");
         assert!(key.value.is_none());
         let sel = key.value_from.unwrap().secret_key_ref.unwrap();
         assert_eq!(sel.name, "anthropic-key");
         assert_eq!(sel.key, "api-key");
+
+        // The invented CALIBAN_* namespace caliban never implemented.
+        assert!(
+            get("CALIBAN_PROVIDER_BASE_URL").is_none(),
+            "caliban never reads CALIBAN_PROVIDER_BASE_URL"
+        );
+        assert!(
+            get("CALIBAN_API_KEY").is_none(),
+            "caliban never reads CALIBAN_API_KEY"
+        );
+        // The model travels in caliband's SpawnSpec (prospero#168), not in env.
+        assert!(
+            get("CALIBAN_MODEL").is_none(),
+            "caliban never reads CALIBAN_MODEL"
+        );
+    }
+
+    /// #30: the case that wedged the live cluster — a remote ollama whose base
+    /// URL never reached the provider client.
+    #[test]
+    fn provider_env_projects_ollama_base_url() {
+        use crate::workspace::ResolvedProvider;
+        let rp = ResolvedProvider {
+            name: "workers".into(),
+            kind: "ollama".into(),
+            base_url: Some("http://192.168.1.240:11434".into()),
+            model: None,
+            credentials_ref: None,
+        };
+        let env = provider_env(&rp);
+        assert_eq!(
+            env.iter()
+                .find(|e| e.name == "OLLAMA_BASE_URL")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("http://192.168.1.240:11434")
+        );
+    }
+
+    /// #30: caliban's google provider reads the `GEMINI_*` pair, so a naive
+    /// uppercase of the kind (`GOOGLE_*`) would miss it.
+    #[test]
+    fn provider_env_maps_google_kind_onto_the_gemini_env_pair() {
+        use crate::workspace::{CredentialsRef, ResolvedProvider};
+        let rp = ResolvedProvider {
+            name: "g".into(),
+            kind: "google".into(),
+            base_url: Some("https://generativelanguage.googleapis.com".into()),
+            model: None,
+            credentials_ref: Some(CredentialsRef {
+                secret_name: "g-key".into(),
+                key: "api-key".into(),
+            }),
+        };
+        let env = provider_env(&rp);
+        assert!(env.iter().any(|e| e.name == "GEMINI_BASE_URL"));
+        assert!(env.iter().any(|e| e.name == "GEMINI_API_KEY"));
+        assert!(!env.iter().any(|e| e.name == "GOOGLE_BASE_URL"));
     }
 
     #[test]
@@ -814,8 +899,10 @@ mod tests {
             credentials_ref: None,
         };
         let env = provider_env(&rp);
-        assert!(!env.iter().any(|e| e.name == "CALIBAN_API_KEY"));
-        assert!(!env.iter().any(|e| e.name == "CALIBAN_MODEL"));
+        assert!(!env.iter().any(|e| e.name.ends_with("_API_KEY")));
+        // CALIBAN_PROVIDER is still projected: caliban does not use it to select
+        // a provider (prospero#168 / caliban#93 — that travels in the SpawnSpec),
+        // but it is the documented input to a user-configured `apiKeyHelper`.
         assert_eq!(
             env.iter()
                 .find(|e| e.name == "CALIBAN_PROVIDER")
