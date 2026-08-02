@@ -27,8 +27,10 @@ pub struct WorkspaceSpec {
     /// Human-friendly dashboard label.
     #[schemars(length(min = 1))]
     pub display_name: String,
-    /// The workspace's git checkouts (1..N).
-    #[schemars(length(min = 1))]
+    /// The workspace's git checkouts (0..N). Optional at creation: a workspace
+    /// may be registered bare and have sources added later (#21). `providers`
+    /// stays required — `resolve` needs a bindable provider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<Source>,
     /// Named providers (1..N) agents in this workspace can bind to.
     #[schemars(length(min = 1))]
@@ -362,12 +364,57 @@ mod tests {
         let crd = Workspace::crd();
         let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
         let spec = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"];
-        assert_eq!(spec["sources"]["minItems"], 1);
         assert_eq!(spec["providers"]["minItems"], 1);
         assert_eq!(spec["displayName"]["minLength"], 1);
         let prov = &spec["providers"]["items"]["properties"];
         assert_eq!(prov["name"]["minLength"], 1);
         assert_eq!(prov["kind"]["minLength"], 1);
+    }
+
+    /// #21: a workspace may legitimately start with no checkouts and have them
+    /// added later, so `minItems: 1` + `required` on `sources` wrongly blocked
+    /// registering one at all (422 from the apiserver). `providers` keeps its
+    /// constraint — `resolve` relies on there being a bindable provider.
+    #[test]
+    fn crd_allows_a_workspace_with_no_sources() {
+        let crd = Workspace::crd();
+        let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
+        let spec = &schema["openAPIV3Schema"]["properties"]["spec"];
+
+        assert!(
+            spec["properties"]["sources"]["minItems"].is_null(),
+            "sources must not carry minItems"
+        );
+        let required: Vec<&str> = spec["required"]
+            .as_array()
+            .expect("spec.required")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            !required.contains(&"sources"),
+            "sources must not be required, got {required:?}"
+        );
+        // The tightening this ticket does NOT relax.
+        assert!(required.contains(&"providers"));
+        assert!(required.contains(&"displayName"));
+    }
+
+    /// The Rust type must accept the same source-less spec the schema now does.
+    #[test]
+    fn source_less_workspace_deserializes() {
+        let yaml = r#"
+apiVersion: caliban.caliban-ai.dev/v1alpha1
+kind: Workspace
+metadata: { name: bare, namespace: team-a }
+spec:
+  displayName: Bare
+  providers:
+    - { name: only, kind: ollama, baseUrl: "http://ollama.example.com:11434" }
+"#;
+        let ws: Workspace = serde_norway::from_str(yaml).unwrap();
+        assert!(ws.spec.sources.is_empty());
+        assert_eq!(ws.spec.providers.len(), 1);
     }
 
     #[test]
