@@ -31,6 +31,10 @@ pub struct Settings {
     pub session_token_secret: String,
     /// Key within the token Secret.
     pub session_token_key: String,
+    /// Name the session-plane serving cert is verified against — must equal
+    /// that cert's SAN (the chart's `global.sessionPlane.serverName`). Handed
+    /// to caliband so workers can verify the control listener (#32).
+    pub session_server_name: String,
 }
 
 impl Default for Settings {
@@ -46,6 +50,7 @@ impl Default for Settings {
             session_tls_secret: "caliban-session-plane-tls".to_string(),
             session_token_secret: "caliban-session-plane-token".to_string(),
             session_token_key: "token".to_string(),
+            session_server_name: "caliband".to_string(),
         }
     }
 }
@@ -54,7 +59,8 @@ impl Settings {
     /// Read settings from `CALIBAND_IMAGE`, `CALIBAND_PORT`, `CALIBAN_AGENT_PORT_BASE`,
     /// `CALIBAN_AGENT_PORT_END`, `CALIBAN_WORKSPACE_ROOT`, `CALIBAN_WORKSPACE_STORAGE`,
     /// `CALIBAN_GIT_IMAGE`, `CALIBAN_SESSION_TLS_SECRET`, `CALIBAN_SESSION_TOKEN_SECRET`,
-    /// `CALIBAN_SESSION_TOKEN_KEY`, falling back to defaults.
+    /// `CALIBAN_SESSION_TOKEN_KEY`, `CALIBAN_SESSION_SERVER_NAME`, falling back
+    /// to defaults.
     pub fn from_env() -> Self {
         let d = Self::default();
         Self {
@@ -81,6 +87,8 @@ impl Settings {
                 .unwrap_or(d.session_token_secret),
             session_token_key: std::env::var("CALIBAN_SESSION_TOKEN_KEY")
                 .unwrap_or(d.session_token_key),
+            session_server_name: std::env::var("CALIBAN_SESSION_SERVER_NAME")
+                .unwrap_or(d.session_server_name),
         }
     }
 }
@@ -197,6 +205,15 @@ mod tests {
         assert_eq!(s.session_tls_secret, "caliban-session-plane-tls");
         assert_eq!(s.session_token_secret, "caliban-session-plane-token");
         assert_eq!(s.session_token_key, "token");
+    }
+
+    /// #32: the CA is only usable if the name being verified matches the
+    /// serving cert's SAN. The chart already pins one value
+    /// (`global.sessionPlane.serverName`) for both the SAN and the SNI, so the
+    /// operator's default must agree with it — `localhost` would never verify.
+    #[test]
+    fn session_server_name_defaults_to_the_serving_cert_san() {
+        assert_eq!(Settings::default().session_server_name, "caliband");
     }
 
     #[test]

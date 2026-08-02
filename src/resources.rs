@@ -284,6 +284,12 @@ pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> S
             format!("{TLS_MOUNT}/tls.crt"),
             "--tls-key".to_string(),
             format!("{TLS_MOUNT}/tls.key"),
+            // Hand caliband its own trust anchor (#32). Without a CA it cannot
+            // pass one down to the workers it spawns, so their status reports
+            // fail the handshake and an interactive agent never reaches Idle.
+            // The key is already in the mounted session-plane Secret.
+            "--tls-ca".to_string(),
+            format!("{TLS_MOUNT}/ca.crt"),
         ]),
         env: Some({
             let mut e = caliband_env(t, rw);
@@ -299,6 +305,20 @@ pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> S
                     ..Default::default()
                 }),
             });
+            // Trust material for the control listener the workers report Idle/
+            // Running on (#32). Workers inherit this environment, so without it
+            // they dial caliband's TLS port in plaintext and every report is
+            // silently dropped — leaving an interactive agent stuck in Running
+            // and prospero with no reply box. The name verified must be the
+            // serving cert's SAN; `build_status_client` otherwise falls back to
+            // `localhost`, which never matches in-cluster.
+            // caliban#510 replaces the inheritance with explicit forwarding in
+            // ExecWorkerLauncher; these stay correct when it does.
+            e.push(env("CALIBAN_CONTROL_TLS_CA", format!("{TLS_MOUNT}/ca.crt")));
+            e.push(env(
+                "CALIBAN_CONTROL_TLS_SERVER_NAME",
+                s.session_server_name.clone(),
+            ));
             e
         }),
         volume_mounts: Some(vec![
@@ -776,6 +796,58 @@ mod tests {
             vol.secret.as_ref().unwrap().secret_name.as_deref(),
             Some("caliban-session-plane-tls")
         );
+    }
+
+    /// #32: caliband was launched with cert+key but no CA, so it had no trust
+    /// anchor to hand down to the workers it spawns. The CA is already in the
+    /// mounted `kubernetes.io/tls` Secret — only the flag was missing.
+    #[test]
+    fn sandbox_passes_session_plane_ca_to_caliband() {
+        let sb = build_sandbox(&task(), &resolved(), &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let args = pod.containers[0].args.as_ref().unwrap();
+        let ca_idx = args.iter().position(|a| a == "--tls-ca").expect("--tls-ca");
+        assert_eq!(args[ca_idx + 1], "/etc/caliband/tls/ca.crt");
+    }
+
+    /// #32: a CA caliband never forwards is inert. Workers inherit caliband's
+    /// environment, so publishing the control-plane trust material here is what
+    /// makes their Idle/Running reports survive the handshake. The verified
+    /// name must be the cert's SAN, not `build_status_client`'s `localhost`
+    /// default. caliban#510 makes the launcher pass these explicitly.
+    #[test]
+    fn sandbox_wires_control_plane_trust_for_spawned_workers() {
+        let sb = build_sandbox(&task(), &resolved(), &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let env = pod.containers[0].env.as_ref().unwrap();
+        let get = |n: &str| {
+            env.iter()
+                .find(|e| e.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+                .value
+                .as_deref()
+        };
+        assert_eq!(
+            get("CALIBAN_CONTROL_TLS_CA"),
+            Some("/etc/caliband/tls/ca.crt")
+        );
+        assert_eq!(get("CALIBAN_CONTROL_TLS_SERVER_NAME"), Some("caliband"));
+    }
+
+    /// The verified name tracks the configured SAN rather than being hardcoded.
+    #[test]
+    fn control_plane_server_name_follows_settings() {
+        let s = Settings {
+            session_server_name: "sessions.example.svc".to_string(),
+            ..Settings::default()
+        };
+        let sb = build_sandbox(&task(), &resolved(), &s);
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let env = pod.containers[0].env.as_ref().unwrap();
+        assert!(env
+            .iter()
+            .any(|e| e.name == "CALIBAN_CONTROL_TLS_SERVER_NAME"
+                && e.value.as_deref() == Some("sessions.example.svc")));
     }
 
     #[test]
