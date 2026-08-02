@@ -68,6 +68,18 @@ the caliban image's Dockerfile:
   port routing. `build_sandbox` now passes `--advertise-host <sandbox>.<ns>.svc.cluster.local`
   and pins `--agent-port-base`, and the NetworkPolicy opens the matching per-agent stream
   window alongside the control port.
+- **Session-plane TLS needs the CA, not just the keypair** — _resolved
+  ([#32](https://github.com/caliban-ai/caliban-operator/issues/32))._ The TLS follow-up to
+  decision 4 landed `--tls-cert`/`--tls-key` but no `--tls-ca`, so caliband had no trust
+  anchor to hand down to the workers it spawns. Their Idle/Running reports failed the
+  handshake and were silently dropped, leaving interactive agents stuck in `Running`.
+  `build_sandbox` now also passes `--tls-ca <mount>/ca.crt` (the key was already in the
+  mounted `kubernetes.io/tls` Secret) and publishes `CALIBAN_CONTROL_TLS_CA` +
+  `CALIBAN_CONTROL_TLS_SERVER_NAME` on the caliband container, which the workers inherit.
+  The verified name comes from the new `session_server_name` setting and must equal the
+  serving cert's SAN — `build_status_client`'s `localhost` default never matches
+  in-cluster. caliban [#510](https://github.com/caliban-ai/caliban/issues/510) replaces the
+  env inheritance with explicit forwarding in `ExecWorkerLauncher`.
 - **`git clone --depth 1 --branch <ref>` accepts branch/tag names only, not commit
   SHAs** — a `ref` set to a raw commit SHA will fail the clone (the CRD's `ref` defaults
   to `main`; SHA-pinning is a follow-up).
