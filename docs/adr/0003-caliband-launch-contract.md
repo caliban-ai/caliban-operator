@@ -80,6 +80,18 @@ the caliban image's Dockerfile:
   serving cert's SAN — `build_status_client`'s `localhost` default never matches
   in-cluster. caliban [#510](https://github.com/caliban-ai/caliban/issues/510) replaces the
   env inheritance with explicit forwarding in `ExecWorkerLauncher`.
+- **The verified name must be on argv, not only in the env** — _resolved
+  ([#35](https://github.com/caliban-ai/caliban-operator/issues/35))._ Once caliban #510
+  landed, that explicit forwarding became the problem: `ExecWorkerLauncher` sets each
+  worker's `CALIBAN_CONTROL_TLS_SERVER_NAME` from caliband's *own resolved* name,
+  overriding the value the worker used to inherit from the pod env. Absent
+  `--tls-server-name`, caliband resolves that name from `--advertise-host` (the per-pod DNS
+  name), which the serving cert cannot prove — its only SAN is the session-plane name. So
+  workers verified against the wrong name, the handshake failed, and interactive agents
+  were still stuck in `Running` even with the CA correctly in place. `build_sandbox` now
+  passes `--tls-server-name <session_server_name>` alongside `--tls-ca`. The general lesson:
+  when a downstream component forwards a value explicitly, the env var stops being the
+  contract — argv is.
 - **`git clone --depth 1 --branch <ref>` accepts branch/tag names only, not commit
   SHAs** — a `ref` set to a raw commit SHA will fail the clone (the CRD's `ref` defaults
   to `main`; SHA-pinning is a follow-up).
