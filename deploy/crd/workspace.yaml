@@ -114,7 +114,10 @@ spec:
                 minItems: 1
                 type: array
               sources:
-                description: The workspace's git checkouts (1..N).
+                description: |-
+                  The workspace's git checkouts (0..N). Optional at creation: a workspace
+                  may be registered bare and have sources added later (#21). `providers`
+                  stays required — `resolve` needs a bindable provider.
                 items:
                   description: A single source checkout in the workspace.
                   properties:
@@ -139,12 +142,10 @@ spec:
                   - path
                   - repo
                   type: object
-                minItems: 1
                 type: array
             required:
             - displayName
             - providers
-            - sources
             type: object
           status:
             description: Observed state of a `Workspace`.
