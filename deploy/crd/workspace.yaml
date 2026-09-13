@@ -74,13 +74,13 @@ spec:
                   description: A named model provider bound within a workspace.
                   properties:
                     baseUrl:
-                      description: Override base URL (e.g. `http://ollama.example.com:11434`).
+                      description: Override base URL (e.g. `http://localhost:9292/v1`).
                       nullable: true
                       type: string
                     credentialsRef:
                       description: |-
                         Reference to an existing Secret for this provider's API key. Keyless
-                        providers (e.g. ollama) omit it.
+                        providers (e.g. a local `openai` endpoint) omit it.
                       nullable: true
                       properties:
                         key:
@@ -96,7 +96,7 @@ spec:
                       - secretName
                       type: object
                     kind:
-                      description: Provider kind (e.g. `ollama`, `anthropic`, `openai`).
+                      description: Provider kind (e.g. `anthropic`, `openai`, `google`).
                       minLength: 1
                       type: string
                     model:

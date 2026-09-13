@@ -34,7 +34,8 @@ Forces:
   provider bindings are workspace-scoped, shared across many `CalibanTask`s, and
   meaningfully exist before the first task is created.
 - **Multiple named providers, not one.** A workspace may bind a cheap/local model
-  (e.g. Ollama) for routine work and a stronger hosted model (e.g. Anthropic) for
+  (e.g. a local `openai`-compatible server such as llama.cpp) for routine work and a
+  stronger hosted model (e.g. Anthropic) for
   harder tasks; a task picks one by name at submission time, not at workspace-authoring
   time.
 - **Prospero must never read Secrets.** Its CRUD surface is the `Workspace`/

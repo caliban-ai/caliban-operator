@@ -54,17 +54,17 @@ pub struct Provider {
     /// Provider identifier, unique within the workspace (e.g. `planner`).
     #[schemars(length(min = 1))]
     pub name: String,
-    /// Provider kind (e.g. `ollama`, `anthropic`, `openai`).
+    /// Provider kind (e.g. `anthropic`, `openai`, `google`).
     #[schemars(length(min = 1))]
     pub kind: String,
-    /// Override base URL (e.g. `http://ollama.example.com:11434`).
+    /// Override base URL (e.g. `http://localhost:9292/v1`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     /// Default model for this provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Reference to an existing Secret for this provider's API key. Keyless
-    /// providers (e.g. ollama) omit it.
+    /// providers (e.g. a local `openai` endpoint) omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials_ref: Option<CredentialsRef>,
 }
@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn keyless_provider_needs_no_secret() {
         let mut p = provider("workers", None);
-        p.kind = "ollama".into();
+        p.kind = "openai".into();
         let spec = spec_with(vec![p], None);
         let v = validate_workspace(&spec, |_, _| false); // no secrets exist at all
         assert_eq!(v.phase, WorkspacePhase::Ready);
@@ -410,7 +410,7 @@ metadata: { name: bare, namespace: team-a }
 spec:
   displayName: Bare
   providers:
-    - { name: only, kind: ollama, baseUrl: "http://ollama.example.com:11434" }
+    - { name: only, kind: openai, baseUrl: "http://localhost:9292/v1" }
 "#;
         let ws: Workspace = serde_norway::from_str(yaml).unwrap();
         assert!(ws.spec.sources.is_empty());
@@ -429,7 +429,7 @@ spec:
     - { name: caliban, repo: "git@example:caliban", ref: main, path: /work/caliban }
   providers:
     - { name: planner, kind: anthropic, model: claude-opus-4-8, credentialsRef: { secretName: anthropic-key, key: api-key } }
-    - { name: workers, kind: ollama, baseUrl: "http://ollama.example.com:11434", model: qwen2.5-coder }
+    - { name: workers, kind: openai, baseUrl: "http://localhost:9292/v1", model: qwen2.5-coder }
   defaultProvider: planner
 "#;
         let ws: Workspace = serde_norway::from_str(yaml).unwrap();
@@ -520,6 +520,6 @@ spec:
         assert_eq!(ct.spec.provider_ref.as_deref(), Some("workers"));
         // The sample CalibanTask references a provider the sample Workspace defines.
         let r = resolve_workspace(&ws.spec, ct.spec.provider_ref.as_deref()).unwrap();
-        assert_eq!(r.provider.kind, "ollama");
+        assert_eq!(r.provider.kind, "openai");
     }
 }
