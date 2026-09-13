@@ -289,7 +289,7 @@ mod tests {
                 }],
                 providers: vec![Provider {
                     name: "workers".into(),
-                    kind: "ollama".into(),
+                    kind: "openai".into(),
                     base_url: None,
                     model: None,
                     credentials_ref: None,

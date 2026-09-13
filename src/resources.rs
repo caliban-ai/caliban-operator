@@ -135,7 +135,7 @@ fn caliband_env(t: &CalibanTask, rw: &ResolvedWorkspace) -> Vec<EnvVar> {
 /// The env-name prefix caliban reads for a provider kind — the `{PROVIDER}` in
 /// `{PROVIDER}_BASE_URL` / `{PROVIDER}_API_KEY` (#30, caliban#390's acceptance).
 ///
-/// Uppercasing the kind is right for `anthropic`, `openai` and `ollama`, but
+/// Uppercasing the kind is right for `anthropic` and `openai`, but
 /// two kinds are irregular on caliban's side and must be aliased explicitly:
 /// its google provider reads the `GEMINI_*` pair, and its Azure path reads
 /// `AZURE_OPENAI_*`. An unknown kind falls back to the uppercase form, which is
@@ -153,7 +153,7 @@ fn provider_env_prefix(kind: &str) -> String {
 ///
 /// Base URL and API key are projected under **provider-native** names (#30).
 /// caliban implements no `CALIBAN_*` namespace for these: it reads
-/// `OLLAMA_BASE_URL`, `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`, and so on.
+/// `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`, and so on.
 /// Projecting `CALIBAN_PROVIDER_BASE_URL` / `CALIBAN_API_KEY` silently dropped
 /// both the endpoint and the credential — the pod looked correctly configured
 /// while the agent could reach nothing.
@@ -452,7 +452,7 @@ mod tests {
             }],
             provider: ResolvedProvider {
                 name: "workers".into(),
-                kind: "ollama".into(),
+                kind: "openai".into(),
                 base_url: None,
                 model: None,
                 credentials_ref: None,
@@ -742,7 +742,7 @@ mod tests {
         let env = pod.containers[0].env.as_ref().unwrap();
         assert!(env
             .iter()
-            .any(|e| e.name == "CALIBAN_PROVIDER" && e.value.as_deref() == Some("ollama")));
+            .any(|e| e.name == "CALIBAN_PROVIDER" && e.value.as_deref() == Some("openai")));
         assert!(env
             .iter()
             .any(|e| e.name == "FOO" && e.value.as_deref() == Some("bar")));
@@ -1002,26 +1002,26 @@ mod tests {
         );
     }
 
-    /// #30: the case that wedged the live cluster — a remote ollama whose base
-    /// URL never reached the provider client.
+    /// #30: the case that wedged the live cluster — a remote self-hosted
+    /// (openai-compatible) provider whose base URL never reached the client.
     #[test]
-    fn provider_env_projects_ollama_base_url() {
+    fn provider_env_projects_openai_base_url() {
         use crate::workspace::ResolvedProvider;
         let rp = ResolvedProvider {
             name: "workers".into(),
-            kind: "ollama".into(),
-            base_url: Some("http://192.168.1.240:11434".into()),
+            kind: "openai".into(),
+            base_url: Some("http://192.168.1.240:9292/v1".into()),
             model: None,
             credentials_ref: None,
         };
         let env = provider_env(&rp);
         assert_eq!(
             env.iter()
-                .find(|e| e.name == "OLLAMA_BASE_URL")
+                .find(|e| e.name == "OPENAI_BASE_URL")
                 .unwrap()
                 .value
                 .as_deref(),
-            Some("http://192.168.1.240:11434")
+            Some("http://192.168.1.240:9292/v1")
         );
     }
 
@@ -1051,8 +1051,8 @@ mod tests {
         use crate::workspace::ResolvedProvider;
         let rp = ResolvedProvider {
             name: "workers".into(),
-            kind: "ollama".into(),
-            base_url: Some("http://192.168.1.240:11434".into()),
+            kind: "openai".into(),
+            base_url: Some("http://192.168.1.240:9292/v1".into()),
             model: None,
             credentials_ref: None,
         };
@@ -1067,7 +1067,7 @@ mod tests {
                 .unwrap()
                 .value
                 .as_deref(),
-            Some("ollama")
+            Some("openai")
         );
     }
 }
