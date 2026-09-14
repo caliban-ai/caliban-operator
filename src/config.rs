@@ -124,6 +124,34 @@ impl Settings {
             ),
         }
     }
+
+    /// Reject settings that would otherwise fail late (#49). A bad port window
+    /// surfaced only as a NetworkPolicy the API server rejected on every
+    /// reconcile; checking once at startup names the offending variable.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, port) in [
+            ("CALIBAND_PORT", self.caliband_port),
+            ("CALIBAN_AGENT_PORT_BASE", self.agent_port_base),
+            ("CALIBAN_AGENT_PORT_END", self.agent_port_end),
+        ] {
+            if !(1..=65535).contains(&port) {
+                return Err(format!("{name} {port} is outside 1-65535"));
+            }
+        }
+        if self.agent_port_base > self.agent_port_end {
+            return Err(format!(
+                "agent port window is empty: CALIBAN_AGENT_PORT_BASE {} > CALIBAN_AGENT_PORT_END {}",
+                self.agent_port_base, self.agent_port_end
+            ));
+        }
+        if (self.agent_port_base..=self.agent_port_end).contains(&self.caliband_port) {
+            return Err(format!(
+                "CALIBAND_PORT {} falls inside the agent port window {}-{}",
+                self.caliband_port, self.agent_port_base, self.agent_port_end
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Resolve an optional resource quantity from its env value (#50): unset →
@@ -135,6 +163,25 @@ pub fn optional_quantity(value: Option<String>, default: Option<&str>) -> Option
         Some(v) if v.trim().is_empty() => None,
         Some(v) => Some(v.trim().to_string()),
     }
+}
+
+/// The longest name Kubernetes accepts for a Service (a DNS-1035 label).
+const SERVICE_NAME_MAX: usize = 63;
+
+/// Why a task's name can't be provisioned, if it can't (#49). agent-sandbox
+/// names the Sandbox's headless Service after the Sandbox, `{task}-sbx`, and a
+/// Service name is at most 63 characters, so a longer task name fails every
+/// apply. Task names are immutable, so this is permanent for the object.
+pub fn task_name_problem(t: &CalibanTask) -> Option<String> {
+    let task = t.name_any();
+    let service = sandbox_name(t);
+    (service.len() > SERVICE_NAME_MAX).then(|| {
+        format!(
+            "task name '{task}' is {} characters; its Sandbox Service name '{service}' must be at most {SERVICE_NAME_MAX} characters (task names up to {})",
+            task.len(),
+            SERVICE_NAME_MAX - (service.len() - task.len())
+        )
+    })
 }
 
 /// Name of the Sandbox backing a task.
@@ -303,5 +350,68 @@ mod tests {
             caliband_advertise_host(&t),
             "refactor-auth-sbx.team-a.svc.cluster.local"
         );
+    }
+
+    #[test]
+    fn default_settings_are_valid() {
+        assert_eq!(Settings::default().validate(), Ok(()));
+    }
+
+    /// #49: a bad port window used to surface only as a NetworkPolicy the API
+    /// server rejects on every reconcile. Fail once, at startup, instead.
+    #[test]
+    fn an_empty_agent_port_window_is_rejected() {
+        let s = Settings {
+            agent_port_base: 8000,
+            agent_port_end: 7000,
+            ..Settings::default()
+        };
+        let err = s.validate().unwrap_err();
+        assert!(err.contains("CALIBAN_AGENT_PORT_BASE"), "{err}");
+    }
+
+    /// The control port inside the agent window would let caliband hand a
+    /// per-agent stream the port it is already listening on.
+    #[test]
+    fn a_control_port_inside_the_agent_window_is_rejected() {
+        let s = Settings {
+            caliband_port: 7500,
+            ..Settings::default()
+        };
+        let err = s.validate().unwrap_err();
+        assert!(err.contains("CALIBAND_PORT"), "{err}");
+    }
+
+    #[test]
+    fn out_of_range_ports_are_rejected() {
+        for s in [
+            Settings {
+                caliband_port: 0,
+                ..Settings::default()
+            },
+            Settings {
+                agent_port_end: 70_000,
+                ..Settings::default()
+            },
+        ] {
+            assert!(s.validate().is_err(), "{s:?}");
+        }
+    }
+
+    /// #49: the Sandbox's headless Service is named `{task}-sbx`, and a Service
+    /// name is a DNS-1035 label of at most 63 characters.
+    #[test]
+    fn a_task_name_that_fits_the_sandbox_service_is_accepted() {
+        let mut t = task();
+        t.metadata.name = Some("a".repeat(59));
+        assert!(task_name_problem(&t).is_none());
+    }
+
+    #[test]
+    fn a_task_name_too_long_for_the_sandbox_service_is_reported() {
+        let mut t = task();
+        t.metadata.name = Some("a".repeat(60));
+        let msg = task_name_problem(&t).expect("a 60-character name is too long");
+        assert!(msg.contains("63"), "{msg}");
     }
 }

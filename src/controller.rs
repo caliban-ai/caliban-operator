@@ -15,7 +15,7 @@ use kube::runtime::watcher::Config;
 use kube::runtime::Controller;
 use kube::{Api, Client, Resource, ResourceExt};
 
-use crate::config::{sandbox_name, Settings};
+use crate::config::{sandbox_name, task_name_problem, Settings};
 use crate::crd::{CalibanTask, CalibanTaskStatus, Condition, NamedRef, Phase};
 use crate::resources::plan;
 use crate::sandbox::Sandbox;
@@ -130,18 +130,23 @@ fn status_eq(a: &CalibanTaskStatus, b: &CalibanTaskStatus) -> bool {
 /// reconcile immediately; this timer is only a safety net against missed events.
 pub(crate) const RESYNC: Duration = Duration::from_secs(300);
 
-/// Status for a task whose workspace can't be admitted. Returns `None` when the
-/// observed status already records this exact failure (#55), so a
-/// permanently-failed task isn't re-applied on every reconcile — the same
-/// no-op discipline as `derive_status`.
-pub(crate) fn derive_failed_status(t: &CalibanTask, reason: &str) -> Option<CalibanTaskStatus> {
+/// Status for a task that can't be provisioned: `Failed` with a `Ready=False`
+/// condition carrying `reason` (e.g. `WorkspaceUnresolved`, `InvalidName`) and a
+/// human-readable `message`. Returns `None` when the observed status already
+/// records this exact failure (#55), so a permanently-failed task isn't
+/// re-applied on every reconcile — the same no-op discipline as `derive_status`.
+pub(crate) fn derive_failed_status(
+    t: &CalibanTask,
+    reason: &str,
+    message: &str,
+) -> Option<CalibanTaskStatus> {
     let next = CalibanTaskStatus {
         phase: Phase::Failed,
         conditions: vec![Condition {
             type_: "Ready".into(),
             status: "False".into(),
-            reason: Some("WorkspaceUnresolved".into()),
-            message: Some(reason.to_string()),
+            reason: Some(reason.to_string()),
+            message: Some(message.to_string()),
         }],
         ..Default::default()
     };
@@ -231,6 +236,23 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
     let name = obj.name_any();
     let s = &ctx.settings;
 
+    // #49: without a UID the children can't carry an owner reference; building
+    // one with an empty UID only gets it rejected by the API server.
+    if obj.uid().is_none() {
+        return Err(Error::MissingUid(name));
+    }
+    // #49: a name too long for the Sandbox's Service fails every apply, and
+    // names are immutable — fail once with a clear reason and wait for the
+    // object to change rather than retrying a doomed apply.
+    if let Some(problem) = task_name_problem(&obj) {
+        if let Some(failed) = derive_failed_status(&obj, "InvalidName", &problem) {
+            let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
+            apply_status(&task_api, &name, &failed).await?;
+            tracing::warn!(%ns, %name, %problem, "invalid task name; task Failed");
+        }
+        return Ok(Action::await_change());
+    }
+
     // Pin once: a running task keeps the config it was admitted with. Later
     // edits to the referenced `Workspace` don't re-pin (or disturb) a running task.
     let resolved = match obj
@@ -276,7 +298,8 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
                     return Ok(Action::requeue(Duration::from_secs(10)));
                 }
                 Admission::Fail(reason) => {
-                    if let Some(failed) = derive_failed_status(&obj, &reason) {
+                    if let Some(failed) = derive_failed_status(&obj, "WorkspaceUnresolved", &reason)
+                    {
                         let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
                         apply_status(&task_api, &name, &failed).await?;
                         tracing::warn!(%ns, %name, "workspace unresolved; task Failed");
@@ -322,10 +345,10 @@ fn error_policy(_obj: Arc<CalibanTask>, err: &Error, _ctx: Arc<Context>) -> Acti
 pub async fn run(client: Client) -> anyhow::Result<()> {
     let tasks: Api<CalibanTask> = Api::all(client.clone());
     let sandboxes: Api<Sandbox> = Api::all(client.clone());
-    let ctx = Arc::new(Context {
-        client,
-        settings: Settings::from_env(),
-    });
+    let settings = Settings::from_env();
+    // #49: fail fast on settings that would otherwise break every reconcile.
+    settings.validate().map_err(anyhow::Error::msg)?;
+    let ctx = Arc::new(Context { client, settings });
     Controller::new(tasks, Config::default())
         // Watch the Sandboxes we own (#55): a Sandbox status change — becoming
         // Ready, losing readiness — maps back through its controller owner
@@ -739,17 +762,22 @@ mod tests {
     fn a_repeated_admission_failure_with_the_same_reason_is_not_reapplied() {
         let mut t = task_without_status();
         let reason = "Workspace not found: 'team-a-ws'";
-        t.status = super::derive_failed_status(&t, reason);
+        t.status = super::derive_failed_status(&t, "WorkspaceUnresolved", reason);
         assert_eq!(t.status.as_ref().unwrap().phase, Phase::Failed);
-        assert!(super::derive_failed_status(&t, reason).is_none());
+        assert!(super::derive_failed_status(&t, "WorkspaceUnresolved", reason).is_none());
     }
 
     #[test]
     fn a_changed_admission_failure_reason_is_applied() {
         let mut t = task_without_status();
-        t.status = super::derive_failed_status(&t, "Workspace not found: 'team-a-ws'");
+        t.status = super::derive_failed_status(
+            &t,
+            "WorkspaceUnresolved",
+            "Workspace not found: 'team-a-ws'",
+        );
         let next = "workspace 'team-a-ws' not ready: validation failed";
-        let d = super::derive_failed_status(&t, next).expect("a new reason is a change");
+        let d = super::derive_failed_status(&t, "WorkspaceUnresolved", next)
+            .expect("a new reason is a change");
         assert_eq!(d.phase, Phase::Failed);
         assert_eq!(d.conditions.len(), 1);
         assert_eq!(d.conditions[0].status, "False");
@@ -765,5 +793,26 @@ mod tests {
     #[test]
     fn periodic_resync_is_a_safety_net_not_the_trigger() {
         assert_eq!(super::RESYNC, Duration::from_secs(300));
+    }
+
+    /// #49: a task that fails for a reason other than its workspace carries its
+    /// own reason code, so the cause is legible in `kubectl describe`.
+    #[test]
+    fn a_failure_carries_its_own_reason_code() {
+        let t = task_without_status();
+        let d = super::derive_failed_status(&t, "InvalidName", "too long").unwrap();
+        assert_eq!(d.phase, Phase::Failed);
+        assert_eq!(d.conditions[0].reason.as_deref(), Some("InvalidName"));
+        assert_eq!(d.conditions[0].message.as_deref(), Some("too long"));
+    }
+
+    /// #49: a task with no UID cannot own its children. That is a named error,
+    /// not an owner reference with an empty UID the API server rejects.
+    #[test]
+    fn a_missing_uid_is_a_named_error() {
+        let e = Error::MissingUid("refactor-auth".into());
+        let msg = e.to_string();
+        assert!(msg.contains("refactor-auth"), "{msg}");
+        assert!(msg.contains("uid"), "{msg}");
     }
 }
