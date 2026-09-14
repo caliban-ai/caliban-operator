@@ -125,3 +125,14 @@ Forces:
   schema. We pin the consumed version (`v1beta1`) and cover the fields we use with
   round-trip tests against the published CRD's shape; a breaking upstream change
   surfaces as a deserialize/apply failure, caught in integration.
+- **`serviceFQDN` is not readiness** — _resolved (#45)._ Decision 6's
+  "`Running` once `serviceFQDN` is populated" reported `Ready=True` as soon as the
+  Service object existed, before caliband had bound its port; a crash-looping
+  caliband could present as `Ready` indefinitely and prosperod dialed a dead
+  endpoint. The caliband container now carries TCP readiness and startup probes on
+  the control port (no liveness probe — a restart kills every supervised agent),
+  and `derive_status` gates `Running` on agent-sandbox's own `Sandbox` `Ready`
+  condition, which v0.5.0 sets True only once the pod passes its readiness probe,
+  has an IP, and the Service is ready. An FQDN without that condition stays
+  `Provisioning` with no endpoint, and a reported not-ready surfaces as
+  `Ready=False` / `SandboxNotReady` carrying agent-sandbox's message.

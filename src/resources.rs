@@ -6,8 +6,9 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
     ConfigMapVolumeSource, Container, ContainerPort, EnvVar, EnvVarSource,
-    PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, ResourceRequirements, SecretKeySelector,
-    SecretVolumeSource, ServiceAccount, Volume, VolumeMount, VolumeResourceRequirements,
+    PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
+    SecretKeySelector, SecretVolumeSource, ServiceAccount, TCPSocketAction, Volume, VolumeMount,
+    VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -275,6 +276,19 @@ fn sandbox_resources(s: &Settings) -> Option<ResourceRequirements> {
     })
 }
 
+/// A TCP probe on caliband's control port (#45).
+fn control_port_probe(s: &Settings, period_seconds: i32, failure_threshold: i32) -> Probe {
+    Probe {
+        tcp_socket: Some(TCPSocketAction {
+            port: IntOrString::Int(s.caliband_port),
+            ..Default::default()
+        }),
+        period_seconds: Some(period_seconds),
+        failure_threshold: Some(failure_threshold),
+        ..Default::default()
+    }
+}
+
 fn workspace_pvc(s: &Settings) -> VolumeClaimTemplate {
     VolumeClaimTemplate {
         metadata: ObjectMeta {
@@ -402,6 +416,13 @@ pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> S
             m
         }),
         resources: sandbox_resources(s),
+        // #45: probe the control port so the pod — and agent-sandbox's `Ready`
+        // condition, which the task's `Running` phase gates on — only reports
+        // ready once caliband has actually bound it. Startup tolerates a slow
+        // first bind (up to ~2 min) without the readiness probe flapping.
+        // No liveness probe: restarting caliband kills every agent it runs.
+        readiness_probe: Some(control_port_probe(s, 5, 3)),
+        startup_probe: Some(control_port_probe(s, 2, 60)),
         ..Default::default()
     };
     let mut volumes = vec![Volume {
@@ -611,6 +632,31 @@ mod tests {
             .position(|a| a == "--agent-port-base")
             .expect("--agent-port-base flag present");
         assert_eq!(args[base_idx + 1], "7100");
+    }
+
+    /// #45: with no probe, Kubernetes has no independent signal that caliband has
+    /// bound its control port, so the pod — and in turn the Sandbox's `Ready`
+    /// condition — reports ready while a crash-looping caliband cannot answer.
+    #[test]
+    fn caliband_container_has_tcp_readiness_and_startup_probes_on_the_control_port() {
+        let s = Settings::default();
+        let sb = build_sandbox(&task(), &resolved(), &s);
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let c = &pod.containers[0];
+        for (kind, probe) in [
+            ("readiness", c.readiness_probe.as_ref()),
+            ("startup", c.startup_probe.as_ref()),
+        ] {
+            let probe = probe.unwrap_or_else(|| panic!("caliband has no {kind} probe"));
+            let tcp = probe
+                .tcp_socket
+                .as_ref()
+                .unwrap_or_else(|| panic!("{kind} probe is not a tcpSocket probe"));
+            assert_eq!(tcp.port, IntOrString::Int(s.caliband_port), "{kind}");
+        }
+        // Liveness is deliberately absent: restarting caliband would kill every
+        // agent it supervises, which a readiness gate alone does not.
+        assert!(c.liveness_probe.is_none());
     }
 
     #[test]
