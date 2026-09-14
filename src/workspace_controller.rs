@@ -14,7 +14,9 @@ use kube::runtime::Controller;
 use kube::{Api, Client, ResourceExt};
 
 use crate::config::Settings;
-use crate::workspace::{validate_workspace, Workspace, WorkspaceStatus, WorkspaceValidation};
+use crate::workspace::{
+    validate_workspace, Workspace, WorkspacePhase, WorkspaceStatus, WorkspaceValidation,
+};
 
 /// Shared reconcile context: the API client plus the settings validation needs.
 pub struct Context {
@@ -58,6 +60,19 @@ pub(crate) fn derive_workspace_status(
     }
 }
 
+/// How soon to re-check a workspace (#47). The controller deliberately does not
+/// watch Secrets — that would need cluster-wide `list`/`watch` on every Secret
+/// and cache their data in the operator — so recovery from a missing credential
+/// rides this requeue. A workspace that isn't `Ready` is re-checked quickly, so
+/// creating the Secret unblocks it (and the tasks waiting on it) within
+/// seconds; a `Ready` one keeps a slow safety-net interval.
+pub(crate) fn requeue_after(phase: WorkspacePhase) -> Duration {
+    match phase {
+        WorkspacePhase::Ready => Duration::from_secs(300),
+        WorkspacePhase::Failed | WorkspacePhase::Pending => Duration::from_secs(15),
+    }
+}
+
 async fn reconcile(ws: Arc<Workspace>, ctx: Arc<Context>) -> Result<Action, Error> {
     let ns = ws.namespace().unwrap_or_default();
     let name = ws.name_any();
@@ -84,15 +99,15 @@ async fn reconcile(ws: Arc<Workspace>, ctx: Arc<Context>) -> Result<Action, Erro
         present.contains(&(s.to_string(), k.to_string()))
     });
 
+    let phase = validation.phase;
     if let Some(status) = derive_workspace_status(&ws, validation) {
         let api: Api<Workspace> = Api::namespaced(ctx.client.clone(), &ns);
-        let phase = status.phase;
         let patch = serde_json::json!({ "status": status });
         api.patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
             .await?;
         tracing::info!(%ns, %name, ?phase, "patched Workspace status");
     }
-    Ok(Action::requeue(Duration::from_secs(300)))
+    Ok(Action::requeue(requeue_after(phase)))
 }
 
 fn error_policy(_ws: Arc<Workspace>, err: &Error, _ctx: Arc<Context>) -> Action {
@@ -171,5 +186,27 @@ mod tests {
         ws.status = derive_workspace_status(&ws, v);
         let v2 = validate_workspace(&ws.spec, "/work", |_, _| true);
         assert!(derive_workspace_status(&ws, v2).is_none());
+    }
+
+    /// #47: the controller does not watch Secrets — that would need
+    /// cluster-wide `list`/`watch` on every Secret and cache their data in the
+    /// operator. Recovery from a missing credential therefore rides the
+    /// requeue, so a workspace that isn't Ready is re-checked quickly: creating
+    /// the Secret unblocks it within seconds, not five minutes. A Ready
+    /// workspace keeps the slow safety-net interval.
+    #[test]
+    fn a_workspace_that_is_not_ready_requeues_quickly() {
+        assert_eq!(
+            requeue_after(WorkspacePhase::Failed),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            requeue_after(WorkspacePhase::Pending),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            requeue_after(WorkspacePhase::Ready),
+            Duration::from_secs(300)
+        );
     }
 }
