@@ -130,18 +130,51 @@ pub struct WorkspaceValidation {
     pub message: Option<String>,
 }
 
-/// Pure validation of a `WorkspaceSpec`: unique provider names, a resolvable
+/// Pure validation of a `WorkspaceSpec`: every source path a distinct directory
+/// under `workspace_root`, unique provider names, a resolvable
 /// `defaultProvider`, and an existing Secret key for every `credentialsRef`.
 /// `secret_present(secret_name, key)` reports Secret-key existence (cluster
 /// lookup is the caller's responsibility). First problem found wins.
 pub fn validate_workspace(
     spec: &WorkspaceSpec,
+    workspace_root: &str,
     secret_present: impl Fn(&str, &str) -> bool,
 ) -> WorkspaceValidation {
+    use std::path::{Component, Path, PathBuf};
+
     fn failed(message: String) -> WorkspaceValidation {
         WorkspaceValidation {
             phase: WorkspacePhase::Failed,
             message: Some(message),
+        }
+    }
+
+    // #46: the clone init container mounts the workspace PVC at the root, so a
+    // source must land strictly beneath it. Compare by path *components*, not
+    // string prefix — `/workspace/x` is not under `/work`. A `..` segment could
+    // climb back out, and the root itself would collide with every source.
+    let root = Path::new(workspace_root);
+    let mut seen_paths: std::collections::BTreeMap<PathBuf, &str> = Default::default();
+    for src in &spec.sources {
+        let p = Path::new(&src.path);
+        let under_root = p.is_absolute()
+            && !p.components().any(|c| c == Component::ParentDir)
+            && p.strip_prefix(root)
+                .is_ok_and(|rest| rest.components().next().is_some());
+        if !under_root {
+            return failed(format!(
+                "source '{}': path '{}' must be a directory under the workspace root '{}'",
+                src.name, src.path, workspace_root
+            ));
+        }
+        // Normalised so `/work/app` and `/work/app/` are recognised as one.
+        let normalised: PathBuf = p.components().collect();
+        if let Some(prev) = seen_paths.insert(normalised.clone(), &src.name) {
+            return failed(format!(
+                "sources '{prev}' and '{}' share path '{}'",
+                src.name,
+                normalised.display()
+            ));
         }
     }
 
@@ -291,7 +324,9 @@ mod tests {
             vec![provider("planner", Some(("anthropic-key", "api-key")))],
             Some("planner"),
         );
-        let v = validate_workspace(&spec, |s, k| s == "anthropic-key" && k == "api-key");
+        let v = validate_workspace(&spec, "/work", |s, k| {
+            s == "anthropic-key" && k == "api-key"
+        });
         assert_eq!(v.phase, WorkspacePhase::Ready);
         assert!(v.message.is_none());
     }
@@ -301,7 +336,7 @@ mod tests {
         let mut p = provider("workers", None);
         p.kind = "openai".into();
         let spec = spec_with(vec![p], None);
-        let v = validate_workspace(&spec, |_, _| false); // no secrets exist at all
+        let v = validate_workspace(&spec, "/work", |_, _| false); // no secrets exist at all
         assert_eq!(v.phase, WorkspacePhase::Ready);
     }
 
@@ -311,7 +346,7 @@ mod tests {
             vec![provider("planner", Some(("anthropic-key", "api-key")))],
             None,
         );
-        let v = validate_workspace(&spec, |_, _| false);
+        let v = validate_workspace(&spec, "/work", |_, _| false);
         assert_eq!(v.phase, WorkspacePhase::Failed);
         assert_eq!(
             v.message.as_deref(),
@@ -325,7 +360,7 @@ mod tests {
             vec![provider("planner", None), provider("planner", None)],
             None,
         );
-        let v = validate_workspace(&spec, |_, _| true);
+        let v = validate_workspace(&spec, "/work", |_, _| true);
         assert_eq!(v.phase, WorkspacePhase::Failed);
         assert_eq!(
             v.message.as_deref(),
@@ -336,11 +371,102 @@ mod tests {
     #[test]
     fn dangling_default_provider_fails() {
         let spec = spec_with(vec![provider("planner", None)], Some("nope"));
-        let v = validate_workspace(&spec, |_, _| true);
+        let v = validate_workspace(&spec, "/work", |_, _| true);
         assert_eq!(v.phase, WorkspacePhase::Failed);
         assert_eq!(
             v.message.as_deref(),
             Some("defaultProvider 'nope' names no provider")
+        );
+    }
+
+    /// A spec whose sources sit at `paths` (named `s0`, `s1`, …) with one
+    /// keyless provider, so only source-path validation can fail.
+    fn spec_with_paths(paths: &[&str]) -> WorkspaceSpec {
+        let mut spec = spec_with(vec![provider("workers", None)], None);
+        spec.sources = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Source {
+                name: format!("s{i}"),
+                repo: "git@x:r".into(),
+                r#ref: "main".into(),
+                path: (*p).into(),
+            })
+            .collect();
+        spec
+    }
+
+    fn validate_paths(root: &str, paths: &[&str]) -> WorkspaceValidation {
+        validate_workspace(&spec_with_paths(paths), root, |_, _| true)
+    }
+
+    // #46: the clone init container mounts the PVC at the workspace root; a
+    // source outside it clones into the container's ephemeral layer and is
+    // silently lost (and re-cloned) on every restart.
+
+    #[test]
+    fn sources_under_the_workspace_root_are_ready() {
+        let v = validate_paths("/work", &["/work/caliban", "/work/team/app"]);
+        assert_eq!(v.phase, WorkspacePhase::Ready);
+        assert!(v.message.is_none());
+    }
+
+    #[test]
+    fn a_trailing_slash_on_the_root_is_tolerated() {
+        let v = validate_paths("/work/", &["/work/caliban"]);
+        assert_eq!(v.phase, WorkspacePhase::Ready);
+    }
+
+    #[test]
+    fn a_source_outside_the_root_fails_naming_the_source() {
+        let v = validate_paths("/work", &["/srv/app"]);
+        assert_eq!(v.phase, WorkspacePhase::Failed);
+        assert_eq!(
+            v.message.as_deref(),
+            Some(
+                "source 's0': path '/srv/app' must be a directory under the workspace root '/work'"
+            )
+        );
+    }
+
+    #[test]
+    fn a_sibling_sharing_the_root_as_a_string_prefix_fails() {
+        // `/workspace/x` starts with the string `/work` but is not under it.
+        let v = validate_paths("/work", &["/workspace/x"]);
+        assert_eq!(v.phase, WorkspacePhase::Failed);
+    }
+
+    #[test]
+    fn a_source_at_the_root_itself_fails() {
+        // Cloning into the mount root would collide with every other source.
+        let v = validate_paths("/work", &["/work"]);
+        assert_eq!(v.phase, WorkspacePhase::Failed);
+        let v = validate_paths("/work", &["/work/"]);
+        assert_eq!(v.phase, WorkspacePhase::Failed);
+    }
+
+    #[test]
+    fn a_parent_segment_cannot_escape_the_root() {
+        let v = validate_paths("/work", &["/work/../etc"]);
+        assert_eq!(v.phase, WorkspacePhase::Failed);
+        let v = validate_paths("/work", &["/work/a/../../etc"]);
+        assert_eq!(v.phase, WorkspacePhase::Failed);
+    }
+
+    #[test]
+    fn a_relative_source_path_fails() {
+        let v = validate_paths("/work", &["work/caliban"]);
+        assert_eq!(v.phase, WorkspacePhase::Failed);
+    }
+
+    #[test]
+    fn two_sources_sharing_a_path_fail() {
+        // The second clone is skipped by the `.git` guard, silently.
+        let v = validate_paths("/work", &["/work/app", "/work/app/"]);
+        assert_eq!(v.phase, WorkspacePhase::Failed);
+        assert_eq!(
+            v.message.as_deref(),
+            Some("sources 's0' and 's1' share path '/work/app'")
         );
     }
 

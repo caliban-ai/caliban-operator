@@ -13,7 +13,16 @@ use kube::runtime::watcher::Config;
 use kube::runtime::Controller;
 use kube::{Api, Client, ResourceExt};
 
+use crate::config::Settings;
 use crate::workspace::{validate_workspace, Workspace, WorkspaceStatus, WorkspaceValidation};
+
+/// Shared reconcile context: the API client plus the settings validation needs.
+pub struct Context {
+    /// Kubernetes client.
+    pub client: Client,
+    /// Workspace root the sandbox mounts the PVC at; sources must sit under it (#46).
+    pub workspace_root: String,
+}
 
 /// Controller error.
 #[derive(thiserror::Error, Debug)]
@@ -49,10 +58,10 @@ pub(crate) fn derive_workspace_status(
     }
 }
 
-async fn reconcile(ws: Arc<Workspace>, ctx: Arc<Client>) -> Result<Action, Error> {
+async fn reconcile(ws: Arc<Workspace>, ctx: Arc<Context>) -> Result<Action, Error> {
     let ns = ws.namespace().unwrap_or_default();
     let name = ws.name_any();
-    let secrets: Api<Secret> = Api::namespaced((*ctx).clone(), &ns);
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &ns);
 
     // Resolve which (secretName, key) pairs actually exist, once, up front, so
     // validate_workspace stays pure.
@@ -71,12 +80,12 @@ async fn reconcile(ws: Arc<Workspace>, ctx: Arc<Client>) -> Result<Action, Error
             }
         }
     }
-    let validation = validate_workspace(&ws.spec, |s, k| {
+    let validation = validate_workspace(&ws.spec, &ctx.workspace_root, |s, k| {
         present.contains(&(s.to_string(), k.to_string()))
     });
 
     if let Some(status) = derive_workspace_status(&ws, validation) {
-        let api: Api<Workspace> = Api::namespaced((*ctx).clone(), &ns);
+        let api: Api<Workspace> = Api::namespaced(ctx.client.clone(), &ns);
         let phase = status.phase;
         let patch = serde_json::json!({ "status": status });
         api.patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
@@ -86,7 +95,7 @@ async fn reconcile(ws: Arc<Workspace>, ctx: Arc<Client>) -> Result<Action, Error
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
-fn error_policy(_ws: Arc<Workspace>, err: &Error, _ctx: Arc<Client>) -> Action {
+fn error_policy(_ws: Arc<Workspace>, err: &Error, _ctx: Arc<Context>) -> Action {
     tracing::warn!(error = %err, "workspace reconcile error");
     Action::requeue(Duration::from_secs(30))
 }
@@ -94,7 +103,10 @@ fn error_policy(_ws: Arc<Workspace>, err: &Error, _ctx: Arc<Client>) -> Action {
 /// Run the Workspace controller until shutdown.
 pub async fn run(client: Client) -> anyhow::Result<()> {
     let workspaces: Api<Workspace> = Api::all(client.clone());
-    let ctx = Arc::new(client);
+    let ctx = Arc::new(Context {
+        client,
+        workspace_root: Settings::from_env().workspace_root,
+    });
     Controller::new(workspaces, Config::default())
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx)
@@ -145,7 +157,7 @@ mod tests {
     #[test]
     fn ready_status_is_derived_and_records_generation() {
         let ws = workspace(3);
-        let v = validate_workspace(&ws.spec, |_, _| true);
+        let v = validate_workspace(&ws.spec, "/work", |_, _| true);
         let s = derive_workspace_status(&ws, v).unwrap();
         assert_eq!(s.phase, WorkspacePhase::Ready);
         assert_eq!(s.observed_generation, Some(3));
@@ -155,9 +167,9 @@ mod tests {
     #[test]
     fn unchanged_status_is_noop() {
         let mut ws = workspace(3);
-        let v = validate_workspace(&ws.spec, |_, _| true);
+        let v = validate_workspace(&ws.spec, "/work", |_, _| true);
         ws.status = derive_workspace_status(&ws, v);
-        let v2 = validate_workspace(&ws.spec, |_, _| true);
+        let v2 = validate_workspace(&ws.spec, "/work", |_, _| true);
         assert!(derive_workspace_status(&ws, v2).is_none());
     }
 }
