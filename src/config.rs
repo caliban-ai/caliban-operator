@@ -44,6 +44,9 @@ pub struct Settings {
     /// Memory limit for the sandbox containers. Unset by default, so a default
     /// install never OOM-kills an agent on a guessed ceiling.
     pub caliband_memory_limit: Option<String>,
+    /// The cluster's DNS domain, used to build caliband's advertise host
+    /// (`{sandbox}.{namespace}.svc.{domain}`). Defaults to `cluster.local` (#54).
+    pub cluster_domain: String,
 }
 
 impl Default for Settings {
@@ -66,6 +69,7 @@ impl Default for Settings {
             caliband_memory_request: Some("512Mi".to_string()),
             caliband_cpu_limit: None,
             caliband_memory_limit: None,
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
         }
     }
 }
@@ -76,8 +80,9 @@ impl Settings {
     /// `CALIBAN_GIT_IMAGE`, `CALIBAN_SESSION_TLS_SECRET`, `CALIBAN_SESSION_TOKEN_SECRET`,
     /// `CALIBAN_SESSION_TOKEN_KEY`, `CALIBAN_SESSION_SERVER_NAME`,
     /// `CALIBAND_CPU_REQUEST`, `CALIBAND_MEMORY_REQUEST`, `CALIBAND_CPU_LIMIT`,
-    /// `CALIBAND_MEMORY_LIMIT`, falling back to defaults. An empty resource
-    /// value clears its default (see [`optional_quantity`]).
+    /// `CALIBAND_MEMORY_LIMIT`, `CALIBAN_CLUSTER_DOMAIN`, falling back to
+    /// defaults. An empty resource value clears its default (see
+    /// [`optional_quantity`]); a blank cluster domain keeps `cluster.local`.
     pub fn from_env() -> Self {
         let d = Self::default();
         Self {
@@ -122,6 +127,7 @@ impl Settings {
                 std::env::var("CALIBAND_MEMORY_LIMIT").ok(),
                 d.caliband_memory_limit.as_deref(),
             ),
+            cluster_domain: cluster_domain(std::env::var("CALIBAN_CLUSTER_DOMAIN").ok()),
         }
     }
 
@@ -184,6 +190,21 @@ pub fn task_name_problem(t: &CalibanTask) -> Option<String> {
     })
 }
 
+/// Kubernetes' default cluster DNS domain.
+const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
+
+/// Resolve the cluster DNS domain from its env value (#54): unset or blank
+/// keeps `cluster.local`; surrounding whitespace and a trailing root dot are
+/// trimmed, so `corp.internal.` doesn't produce `…svc.corp.internal.`.
+pub fn cluster_domain(value: Option<String>) -> String {
+    value
+        .as_deref()
+        .map(|v| v.trim().trim_end_matches('.'))
+        .filter(|v| !v.is_empty())
+        .unwrap_or(DEFAULT_CLUSTER_DOMAIN)
+        .to_string()
+}
+
 /// Name of the Sandbox backing a task.
 pub fn sandbox_name(t: &CalibanTask) -> String {
     format!("{}-sbx", t.name_any())
@@ -199,12 +220,14 @@ pub fn netpol_name(t: &CalibanTask) -> String {
 
 /// In-cluster DNS caliband advertises for its per-agent stream endpoints: the
 /// Sandbox's headless service FQDN. caliband otherwise advertises its `0.0.0.0`
-/// bind address, which prosperod cannot reach (#24).
-pub fn caliband_advertise_host(t: &CalibanTask) -> String {
+/// bind address, which prosperod cannot reach (#24). The domain is the
+/// cluster's configured DNS domain, not a hardcoded `cluster.local` (#54).
+pub fn caliband_advertise_host(t: &CalibanTask, s: &Settings) -> String {
     format!(
-        "{}.{}.svc.cluster.local",
+        "{}.{}.svc.{}",
         sandbox_name(t),
-        t.namespace().unwrap_or_default()
+        t.namespace().unwrap_or_default(),
+        s.cluster_domain
     )
 }
 
@@ -347,8 +370,43 @@ mod tests {
         // in-cluster service DNS, not caliband's 0.0.0.0 bind address (#24).
         let t = task();
         assert_eq!(
-            caliband_advertise_host(&t),
+            caliband_advertise_host(&t, &Settings::default()),
             "refactor-auth-sbx.team-a.svc.cluster.local"
+        );
+    }
+
+    /// #54: clusters provisioned with a non-default DNS domain got an advertise
+    /// host that never resolved, so per-agent stream dials failed.
+    #[test]
+    fn cluster_domain_defaults_to_cluster_local() {
+        assert_eq!(Settings::default().cluster_domain, "cluster.local");
+    }
+
+    #[test]
+    fn advertise_host_uses_the_configured_cluster_domain() {
+        let s = Settings {
+            cluster_domain: "corp.internal".to_string(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            caliband_advertise_host(&task(), &s),
+            "refactor-auth-sbx.team-a.svc.corp.internal"
+        );
+    }
+
+    /// An unset or blank value keeps the default; a fully-qualified value with a
+    /// trailing dot must not yield `…svc.corp.internal.` with a doubled root.
+    #[test]
+    fn cluster_domain_env_value_is_normalised() {
+        assert_eq!(cluster_domain(None), "cluster.local");
+        assert_eq!(cluster_domain(Some("   ".into())), "cluster.local");
+        assert_eq!(
+            cluster_domain(Some("corp.internal".into())),
+            "corp.internal"
+        );
+        assert_eq!(
+            cluster_domain(Some(" corp.internal. ".into())),
+            "corp.internal"
         );
     }
 
