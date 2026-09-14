@@ -8,7 +8,36 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::crd::{Condition, IsolationSpec, Source};
+use crate::crd::{Condition, IsolationSpec};
+
+// Lives here, not in `crd`, because only a `Workspace` has sources;
+// `CalibanTaskSpec` references a workspace instead (#59). (`//` not `///` so
+// this doesn't leak into the generated CRD schema description.)
+/// A single source checkout in the workspace.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Source {
+    /// Source identifier (matches caliband's workspace source name).
+    #[schemars(length(min = 1))]
+    pub name: String,
+    /// Git remote to clone.
+    #[schemars(length(min = 1))]
+    pub repo: String,
+    /// Git ref to check out. Defaults to `main`.
+    #[serde(default = "default_ref")]
+    pub r#ref: String,
+    /// Absolute checkout path in the pod (e.g. `/work/caliban`). Must be a
+    /// directory strictly under the operator's workspace root (default
+    /// `/work`) and distinct from every other source's path; otherwise the
+    /// Workspace goes `Failed`, since a checkout outside the persistent volume
+    /// is lost on every restart.
+    #[schemars(length(min = 1))]
+    pub path: String,
+}
+
+fn default_ref() -> String {
+    "main".to_string()
+}
 
 /// Desired state of a workspace: sources + named providers + defaults.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]

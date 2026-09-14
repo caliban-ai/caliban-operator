@@ -5,6 +5,7 @@
 pub mod config;
 pub mod controller;
 pub mod crd;
+pub mod error;
 pub mod resources;
 pub mod sandbox;
 pub mod workspace;

@@ -22,16 +22,7 @@ use crate::sandbox::Sandbox;
 use crate::workspace::resolve_workspace;
 use crate::workspace::Workspace;
 
-/// Controller error.
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    /// Kubernetes API error.
-    #[error("kube api: {0}")]
-    Kube(#[from] kube::Error),
-    /// Status serialization error.
-    #[error("serialize status: {0}")]
-    Serialize(#[from] serde_json::Error),
-}
+pub use crate::error::Error;
 
 /// Shared reconcile context.
 pub struct Context {
@@ -358,8 +349,9 @@ pub async fn run(client: Client) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{CalibanTaskSpec, Source, TaskSpec, WorkspaceRef};
+    use crate::crd::{CalibanTaskSpec, TaskSpec, WorkspaceRef};
     use crate::sandbox::{SandboxSpec, SandboxStatus};
+    use crate::workspace::Source;
     use crate::workspace::{Provider, Workspace, WorkspacePhase, WorkspaceSpec, WorkspaceStatus};
     use k8s_openapi::api::core::v1::PodTemplateSpec;
 
