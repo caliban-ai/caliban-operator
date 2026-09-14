@@ -134,6 +134,32 @@ fn status_eq(a: &CalibanTaskStatus, b: &CalibanTaskStatus) -> bool {
         && operator_conditions(a) == operator_conditions(b)
 }
 
+/// Periodic re-reconcile interval (#55). The controller watches the Sandboxes it
+/// owns, so a Sandbox status change (e.g. becoming Ready) triggers the task's
+/// reconcile immediately; this timer is only a safety net against missed events.
+pub(crate) const RESYNC: Duration = Duration::from_secs(300);
+
+/// Status for a task whose workspace can't be admitted. Returns `None` when the
+/// observed status already records this exact failure (#55), so a
+/// permanently-failed task isn't re-applied on every reconcile — the same
+/// no-op discipline as `derive_status`.
+pub(crate) fn derive_failed_status(t: &CalibanTask, reason: &str) -> Option<CalibanTaskStatus> {
+    let next = CalibanTaskStatus {
+        phase: Phase::Failed,
+        conditions: vec![Condition {
+            type_: "Ready".into(),
+            status: "False".into(),
+            reason: Some("WorkspaceUnresolved".into()),
+            message: Some(reason.to_string()),
+        }],
+        ..Default::default()
+    };
+    match &t.status {
+        Some(cur) if status_eq(cur, &next) => None,
+        _ => Some(next),
+    }
+}
+
 /// Force-apply the operator's status fields under the `caliban-operator` field
 /// manager (#64, ADR 0005). `force` takes ownership from the legacy merge-patch
 /// manager on existing tasks; it cannot steal another component's fields
@@ -151,14 +177,15 @@ async fn apply_status(
 
 /// Server-side apply `obj` under `name`, force-owned by the operator's field
 /// manager. Used for the operator's own children (SA, NetworkPolicy, Sandbox).
-async fn apply<K>(api: &Api<K>, name: &str, obj: &K) -> Result<(), Error>
+async fn apply<K>(api: &Api<K>, name: &str, obj: &K) -> Result<K, Error>
 where
     K: Clone + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + Resource,
     K::DynamicType: Default,
 {
     let pp = PatchParams::apply("caliban-operator").force();
-    api.patch(name, &pp, &Patch::Apply(obj)).await?;
-    Ok(())
+    // The apply response is the live object (status included), so callers
+    // that need observed state don't have to re-GET it (#55).
+    Ok(api.patch(name, &pp, &Patch::Apply(obj)).await?)
 }
 
 /// Admission decision for a `CalibanTask` against its referenced `Workspace`,
@@ -258,19 +285,14 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
                     return Ok(Action::requeue(Duration::from_secs(10)));
                 }
                 Admission::Fail(reason) => {
-                    let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
-                    let failed = CalibanTaskStatus {
-                        phase: Phase::Failed,
-                        conditions: vec![Condition {
-                            type_: "Ready".into(),
-                            status: "False".into(),
-                            reason: Some("WorkspaceUnresolved".into()),
-                            message: Some(reason),
-                        }],
-                        ..Default::default()
-                    };
-                    apply_status(&task_api, &name, &failed).await?;
-                    tracing::warn!(%ns, %name, "workspace unresolved; task Failed");
+                    if let Some(failed) = derive_failed_status(&obj, &reason) {
+                        let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
+                        apply_status(&task_api, &name, &failed).await?;
+                        tracing::warn!(%ns, %name, "workspace unresolved; task Failed");
+                    }
+                    // Nothing watches the referenced Workspace from here, so keep
+                    // re-checking on a short interval: fixing the workspace is
+                    // what recovers this task.
                     return Ok(Action::requeue(Duration::from_secs(30)));
                 }
             }
@@ -284,11 +306,10 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
     let np_api: Api<NetworkPolicy> = Api::namespaced(ctx.client.clone(), &ns);
     apply(&np_api, &p.network_policy.name_any(), &p.network_policy).await?;
     let sb_api: Api<Sandbox> = Api::namespaced(ctx.client.clone(), &ns);
-    apply(&sb_api, &p.sandbox.name_any(), &p.sandbox).await?;
+    let sandbox = apply(&sb_api, &p.sandbox.name_any(), &p.sandbox).await?;
 
-    // Read the Sandbox back for its status, then derive + patch CalibanTask status.
-    let sandbox = sb_api.get_opt(&sandbox_name(&obj)).await?;
-    if let Some(mut status) = derive_status(&obj, sandbox.as_ref(), s) {
+    // Derive + apply CalibanTask status from the Sandbox the apply returned.
+    if let Some(mut status) = derive_status(&obj, Some(&sandbox), s) {
         let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
         let phase = status.phase;
         // The pin is an operator-owned field too. Under server-side apply,
@@ -298,7 +319,7 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
         apply_status(&task_api, &name, &status).await?;
         tracing::info!(%ns, %name, ?phase, "patched CalibanTask status");
     }
-    Ok(Action::requeue(Duration::from_secs(30)))
+    Ok(Action::requeue(RESYNC))
 }
 
 fn error_policy(_obj: Arc<CalibanTask>, err: &Error, _ctx: Arc<Context>) -> Action {
@@ -309,11 +330,17 @@ fn error_policy(_obj: Arc<CalibanTask>, err: &Error, _ctx: Arc<Context>) -> Acti
 /// Run the CalibanTask controller until shutdown.
 pub async fn run(client: Client) -> anyhow::Result<()> {
     let tasks: Api<CalibanTask> = Api::all(client.clone());
+    let sandboxes: Api<Sandbox> = Api::all(client.clone());
     let ctx = Arc::new(Context {
         client,
         settings: Settings::from_env(),
     });
     Controller::new(tasks, Config::default())
+        // Watch the Sandboxes we own (#55): a Sandbox status change — becoming
+        // Ready, losing readiness — maps back through its controller owner
+        // reference and reconciles the task at once, instead of waiting out a
+        // polling interval. RESYNC is only the safety net.
+        .owns(sandboxes, Config::default())
         // Drain in-flight reconciles on SIGTERM/SIGINT (pod termination, Ctrl+C)
         // instead of hard-killing mid-reconcile.
         .shutdown_on_signal()
@@ -711,5 +738,40 @@ mod tests {
             ["properties"]["conditions"];
         assert_eq!(c["x-kubernetes-list-type"], "map", "{c}");
         assert_eq!(c["x-kubernetes-list-map-keys"], serde_json::json!(["type"]));
+    }
+
+    /// #55: the admission-failure path re-applied an identical status on every
+    /// reconcile, for every permanently-failed task. Like `derive_status`, it
+    /// must skip a write that changes nothing.
+    #[test]
+    fn a_repeated_admission_failure_with_the_same_reason_is_not_reapplied() {
+        let mut t = task_without_status();
+        let reason = "Workspace not found: 'team-a-ws'";
+        t.status = super::derive_failed_status(&t, reason);
+        assert_eq!(t.status.as_ref().unwrap().phase, Phase::Failed);
+        assert!(super::derive_failed_status(&t, reason).is_none());
+    }
+
+    #[test]
+    fn a_changed_admission_failure_reason_is_applied() {
+        let mut t = task_without_status();
+        t.status = super::derive_failed_status(&t, "Workspace not found: 'team-a-ws'");
+        let next = "workspace 'team-a-ws' not ready: validation failed";
+        let d = super::derive_failed_status(&t, next).expect("a new reason is a change");
+        assert_eq!(d.phase, Phase::Failed);
+        assert_eq!(d.conditions.len(), 1);
+        assert_eq!(d.conditions[0].status, "False");
+        assert_eq!(
+            d.conditions[0].reason.as_deref(),
+            Some("WorkspaceUnresolved")
+        );
+        assert_eq!(d.conditions[0].message.as_deref(), Some(next));
+    }
+
+    /// #55: the Sandbox is watched (`owns`), so its status change triggers the
+    /// reconcile directly; the periodic requeue is only a safety net.
+    #[test]
+    fn periodic_resync_is_a_safety_net_not_the_trigger() {
+        assert_eq!(super::RESYNC, Duration::from_secs(300));
     }
 }

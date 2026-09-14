@@ -73,25 +73,47 @@ pub(crate) fn requeue_after(phase: WorkspacePhase) -> Duration {
     }
 }
 
+/// The distinct Secret names a workspace's providers reference, in stable order
+/// (#55). Providers often share one Secret under different keys; reconcile
+/// fetches each Secret once rather than once per provider.
+pub(crate) fn credential_secret_names(
+    spec: &crate::workspace::WorkspaceSpec,
+) -> std::collections::BTreeSet<&str> {
+    spec.providers
+        .iter()
+        .filter_map(|p| p.credentials_ref.as_ref())
+        .map(|c| c.secret_name.as_str())
+        .collect()
+}
+
 async fn reconcile(ws: Arc<Workspace>, ctx: Arc<Context>) -> Result<Action, Error> {
     let ns = ws.namespace().unwrap_or_default();
     let name = ws.name_any();
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &ns);
 
-    // Resolve which (secretName, key) pairs actually exist, once, up front, so
-    // validate_workspace stays pure.
+    // Fetch each referenced Secret once, then resolve which (secretName, key)
+    // pairs actually exist up front, so validate_workspace stays pure.
+    let mut fetched: std::collections::BTreeMap<&str, Secret> = Default::default();
+    for secret_name in credential_secret_names(&ws.spec) {
+        if let Some(sec) = secrets.get_opt(secret_name).await? {
+            fetched.insert(secret_name, sec);
+        }
+    }
     let mut present: std::collections::BTreeSet<(String, String)> = Default::default();
-    for p in &ws.spec.providers {
-        if let Some(c) = &p.credentials_ref {
-            if let Some(sec) = secrets.get_opt(&c.secret_name).await? {
-                let has = sec.data.as_ref().is_some_and(|d| d.contains_key(&c.key))
-                    || sec
-                        .string_data
-                        .as_ref()
-                        .is_some_and(|d| d.contains_key(&c.key));
-                if has {
-                    present.insert((c.secret_name.clone(), c.key.clone()));
-                }
+    for c in ws
+        .spec
+        .providers
+        .iter()
+        .filter_map(|p| p.credentials_ref.as_ref())
+    {
+        if let Some(sec) = fetched.get(c.secret_name.as_str()) {
+            let has = sec.data.as_ref().is_some_and(|d| d.contains_key(&c.key))
+                || sec
+                    .string_data
+                    .as_ref()
+                    .is_some_and(|d| d.contains_key(&c.key));
+            if has {
+                present.insert((c.secret_name.clone(), c.key.clone()));
             }
         }
     }
@@ -208,5 +230,40 @@ mod tests {
             requeue_after(WorkspacePhase::Ready),
             Duration::from_secs(300)
         );
+    }
+
+    /// #55: providers commonly share one credential Secret under different
+    /// keys. Reconcile must fetch each distinct Secret once, not once per
+    /// provider.
+    #[test]
+    fn credential_secret_names_are_deduplicated() {
+        use crate::workspace::CredentialsRef;
+        let with_cred = |name: &str, secret: &str, key: &str| Provider {
+            name: name.into(),
+            kind: "anthropic".into(),
+            base_url: None,
+            model: None,
+            credentials_ref: Some(CredentialsRef {
+                secret_name: secret.into(),
+                key: key.into(),
+            }),
+        };
+        let mut ws = workspace(1);
+        ws.spec.providers = vec![
+            with_cred("planner", "llm-keys", "anthropic"),
+            with_cred("workers", "llm-keys", "openai"),
+            with_cred("review", "other", "k"),
+            Provider {
+                name: "local".into(),
+                kind: "openai".into(),
+                base_url: None,
+                model: None,
+                credentials_ref: None,
+            },
+        ];
+        let names: Vec<&str> = super::credential_secret_names(&ws.spec)
+            .into_iter()
+            .collect();
+        assert_eq!(names, vec!["llm-keys", "other"]);
     }
 }
