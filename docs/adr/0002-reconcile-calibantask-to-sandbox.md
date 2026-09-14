@@ -2,6 +2,7 @@
 
 - **Status:** accepted
 - **Date:** 2026-07-04
+- **Amended by:** [ADR 0005](0005-operator-infrastructure-prospero-agent-lifecycle.md) — decision 6 (status gains prospero's `AgentsSettled` condition as an input, via server-side apply field ownership)
 - **Source:** k8s system-design spec (§"`caliban-operator`", §"agent-sandbox integration") in the caliban-ai docs hub · caliban [#283](https://github.com/caliban-ai/caliban/issues/283) · epic [#274](https://github.com/caliban-ai/caliban/issues/274) · builds on [ADR 0001](0001-kube-rs-stack-and-calibantask-crd.md)
 
 ## Context

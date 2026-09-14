@@ -10,6 +10,7 @@ history.
 |-----|-------|--------|
 | [0000](0000-architecture-decision-records.md) | Record architecture decisions (MADR-lite under `docs/adr/`) | accepted |
 | [0001](0001-kube-rs-stack-and-calibantask-crd.md) | kube-rs stack + `CalibanTask` CRD API (`caliban.caliban-ai.dev/v1alpha1`, namespaced, status subresource; generated CRD YAML) | accepted |
-| [0002](0002-reconcile-calibantask-to-sandbox.md) | Reconcile `CalibanTask` → agent-sandbox `Sandbox` (+ per-task token-less SA & default-deny NetworkPolicy; foreign `Sandbox` type; SSA + owner refs; status from `serviceFQDN`) | accepted |
+| [0002](0002-reconcile-calibantask-to-sandbox.md) | Reconcile `CalibanTask` → agent-sandbox `Sandbox` (+ per-task token-less SA & default-deny NetworkPolicy; foreign `Sandbox` type; SSA + owner refs; status from `serviceFQDN`) | accepted (decision 6 amended by [0005](0005-operator-infrastructure-prospero-agent-lifecycle.md)) |
 | [0003](0003-caliband-launch-contract.md) | The caliband launch contract — daemon `args` (`--workspace-root`/`--listen`), git-clone init container for the workspace, plaintext TCP for the first e2e | accepted |
 | [0004](0004-workspace-crd-and-resolve-and-pin.md) | `Workspace` CRD (named providers, operator-sole-Secret-reader) + `CalibanTask` `workspaceRef`/`providerRef` resolve-and-pin; inline `spec.workspace` removed (pre-v1 breaking) | accepted |
+| [0005](0005-operator-infrastructure-prospero-agent-lifecycle.md) | Component split — operator owns infrastructure, prospero owns agent lifecycle (`AgentsSettled`), status meets via server-side apply field ownership, caliban publishes `caliban-contract` | accepted |
