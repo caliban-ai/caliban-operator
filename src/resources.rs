@@ -375,20 +375,10 @@ pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> S
                     ..Default::default()
                 }),
             });
-            // Trust material for the control listener the workers report Idle/
-            // Running on (#32). Workers inherit this environment, so without it
-            // they dial caliband's TLS port in plaintext and every report is
-            // silently dropped — leaving an interactive agent stuck in Running
-            // and prospero with no reply box. The name verified must be the
-            // serving cert's SAN; `build_status_client` otherwise falls back to
-            // `localhost`, which never matches in-cluster.
-            // caliban#510 replaces the inheritance with explicit forwarding in
-            // ExecWorkerLauncher; these stay correct when it does.
-            e.push(env("CALIBAN_CONTROL_TLS_CA", format!("{TLS_MOUNT}/ca.crt")));
-            e.push(env(
-                "CALIBAN_CONTROL_TLS_SERVER_NAME",
-                s.session_server_name.clone(),
-            ));
+            // No `CALIBAN_CONTROL_TLS_*` here (#59): caliband ≥ 0.8.0 sets both
+            // on each worker it spawns, from `--tls-ca` / `--tls-server-name`
+            // above (caliban#510, #512). A pod-env copy would be a second,
+            // overridden mechanism that could only drift from the argv.
             e
         }),
         volume_mounts: Some({
@@ -501,7 +491,8 @@ pub fn plan(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> ReconcileP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::{CalibanTaskSpec, Source, TaskSpec, WorkspaceRef};
+    use crate::crd::{CalibanTaskSpec, TaskSpec, WorkspaceRef};
+    use crate::workspace::Source;
 
     fn task() -> CalibanTask {
         let mut t = CalibanTask::new(
@@ -1069,58 +1060,30 @@ mod tests {
         assert_eq!(args[ca_idx + 1], "/etc/caliband/tls/ca.crt");
     }
 
-    /// #32: a CA caliband never forwards is inert. Workers inherit caliband's
-    /// environment, so publishing the control-plane trust material here is what
-    /// makes their Idle/Running reports survive the handshake. The verified
-    /// name must be the cert's SAN, not `build_status_client`'s `localhost`
-    /// default. caliban#510 makes the launcher pass these explicitly.
+    /// #59: caliband ≥ 0.8.0 (caliban#510, #512) sets `CALIBAN_CONTROL_TLS_CA`
+    /// and `CALIBAN_CONTROL_TLS_SERVER_NAME` on each worker it spawns, explicitly,
+    /// from its own `--tls-ca` / `--tls-server-name`. The operator passes both
+    /// flags, so publishing the same values in the pod env is a second,
+    /// overridden mechanism that can only drift from the argv. It must be gone.
     #[test]
-    fn sandbox_wires_control_plane_trust_for_spawned_workers() {
+    fn caliband_env_carries_no_control_plane_tls_vars() {
         let sb = build_sandbox(&task(), &resolved(), &Settings::default());
         let pod = sb.spec.pod_template.spec.unwrap();
         let env = pod.containers[0].env.as_ref().unwrap();
-        let get = |n: &str| {
-            env.iter()
-                .find(|e| e.name == n)
-                .unwrap_or_else(|| panic!("{n}"))
-                .value
-                .as_deref()
-        };
-        assert_eq!(
-            get("CALIBAN_CONTROL_TLS_CA"),
-            Some("/etc/caliband/tls/ca.crt")
-        );
-        assert_eq!(get("CALIBAN_CONTROL_TLS_SERVER_NAME"), Some("caliband"));
+        for name in ["CALIBAN_CONTROL_TLS_CA", "CALIBAN_CONTROL_TLS_SERVER_NAME"] {
+            assert!(
+                !env.iter().any(|e| e.name == name),
+                "{name} belongs to caliband's worker launcher, not the pod env"
+            );
+        }
     }
 
-    /// The verified name tracks the configured SAN rather than being hardcoded.
-    #[test]
-    fn control_plane_server_name_follows_settings() {
-        let s = Settings {
-            session_server_name: "sessions.example.svc".to_string(),
-            ..Settings::default()
-        };
-        let sb = build_sandbox(&task(), &resolved(), &s);
-        let pod = sb.spec.pod_template.spec.unwrap();
-        let env = pod.containers[0].env.as_ref().unwrap();
-        assert!(env
-            .iter()
-            .any(|e| e.name == "CALIBAN_CONTROL_TLS_SERVER_NAME"
-                && e.value.as_deref() == Some("sessions.example.svc")));
-    }
-
-    /// #35: the env var above is necessary but NOT sufficient. caliban#510's
-    /// launcher sets the worker's `CALIBAN_CONTROL_TLS_SERVER_NAME` explicitly
-    /// from caliband's own resolved name, which **overrides** whatever the
-    /// worker would have inherited from this pod env. Absent
-    /// `--tls-server-name`, caliband derives that name from `--advertise-host`
-    /// — the per-pod DNS name — while the serving cert's only SAN is the
-    /// session-plane name. The worker then verifies against a name the cert
-    /// cannot prove, the handshake fails, and (the status sink being
-    /// best-effort) every Idle report is silently dropped.
-    ///
-    /// So the argv value is the one that actually wins; it must be on the
-    /// command line, not only in the environment.
+    /// #35: caliban#510's launcher sets each worker's
+    /// `CALIBAN_CONTROL_TLS_SERVER_NAME` explicitly from caliband's own resolved
+    /// name. That name must be the serving cert's SAN: the session-plane name,
+    /// never the per-pod advertise host. A mismatch fails the handshake and,
+    /// the status sink being best-effort, every Idle report is silently
+    /// dropped. So it must be on caliband's command line.
     #[test]
     fn sandbox_passes_session_server_name_to_caliband_on_the_command_line() {
         let sb = build_sandbox(&task(), &resolved(), &Settings::default());
@@ -1137,8 +1100,7 @@ mod tests {
         );
     }
 
-    /// #35: and it must track the configured SAN, not be hardcoded — mirroring
-    /// `control_plane_server_name_follows_settings` for the argv path.
+    /// #35: and it must track the configured SAN, not be hardcoded.
     #[test]
     fn caliband_argv_server_name_follows_settings() {
         let s = Settings {
@@ -1153,34 +1115,6 @@ mod tests {
             .position(|a| a == "--tls-server-name")
             .expect("--tls-server-name");
         assert_eq!(args[idx + 1], "sessions.example.svc");
-    }
-
-    /// #35 guard: the argv name and the env name are two halves of one contract
-    /// and must never disagree — a mismatch is exactly the failure mode this
-    /// ticket exists to close.
-    #[test]
-    fn caliband_argv_and_env_server_name_agree() {
-        let s = Settings {
-            session_server_name: "agree.example.svc".to_string(),
-            ..Settings::default()
-        };
-        let sb = build_sandbox(&task(), &resolved(), &s);
-        let pod = sb.spec.pod_template.spec.unwrap();
-        let c = &pod.containers[0];
-        let args = c.args.as_ref().unwrap();
-        let idx = args
-            .iter()
-            .position(|a| a == "--tls-server-name")
-            .expect("--tls-server-name");
-        let from_env = c
-            .env
-            .as_ref()
-            .unwrap()
-            .iter()
-            .find(|e| e.name == "CALIBAN_CONTROL_TLS_SERVER_NAME")
-            .and_then(|e| e.value.clone())
-            .expect("CALIBAN_CONTROL_TLS_SERVER_NAME");
-        assert_eq!(args[idx + 1], from_env);
     }
 
     #[test]

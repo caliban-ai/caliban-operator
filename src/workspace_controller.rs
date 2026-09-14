@@ -26,16 +26,7 @@ pub struct Context {
     pub workspace_root: String,
 }
 
-/// Controller error.
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    /// Kubernetes API error.
-    #[error("kube api: {0}")]
-    Kube(#[from] kube::Error),
-    /// Status serialization error.
-    #[error("serialize status: {0}")]
-    Serialize(#[from] serde_json::Error),
-}
+pub use crate::error::Error;
 
 /// Derive the new `WorkspaceStatus` from a validation result. Returns `Some`
 /// only when it differs from the observed status (no-op-churn avoidance,
@@ -160,7 +151,7 @@ pub async fn run(client: Client) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::Source;
+    use crate::workspace::Source;
     use crate::workspace::{Provider, WorkspacePhase, WorkspaceSpec};
 
     fn workspace(gen: i64) -> Workspace {
