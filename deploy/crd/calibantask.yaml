@@ -59,7 +59,10 @@ spec:
                 nullable: true
                 properties:
                   routerConfigRef:
-                    description: Name of a ConfigMap holding the router config.
+                    description: |-
+                      Name of a ConfigMap (same namespace) holding the model router config
+                      under the key `caliban.toml`. Mounted read-only into the sandbox and
+                      handed to caliban as `CALIBAN_ROUTER_CONFIG`.
                     nullable: true
                     type: string
                 type: object
