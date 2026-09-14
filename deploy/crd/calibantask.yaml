@@ -192,6 +192,34 @@ spec:
                   later `Workspace` edits don't re-pin a running task.
                 nullable: true
                 properties:
+                  egress:
+                    description: Workspace egress restriction, if any.
+                    nullable: true
+                    properties:
+                      allow:
+                        default: []
+                        description: |-
+                          Destinations agent pods may reach besides DNS. This list replaces the
+                          default allow-all egress: include the workspace's git remotes, its model
+                          provider endpoints, and gonzalod if used. An empty list allows DNS only.
+                        items:
+                          description: One allowed egress destination.
+                          properties:
+                            cidr:
+                              description: Destination CIDR, e.g. `10.0.0.0/8` or `2001:db8::/32`.
+                              minLength: 1
+                              type: string
+                            ports:
+                              description: TCP ports allowed to that CIDR. Empty allows every port.
+                              items:
+                                format: int32
+                                type: integer
+                              type: array
+                          required:
+                          - cidr
+                          type: object
+                        type: array
+                    type: object
                   env:
                     description: Non-secret env from the workspace.
                     items:

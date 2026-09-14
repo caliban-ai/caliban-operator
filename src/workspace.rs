@@ -74,6 +74,37 @@ pub struct WorkspaceSpec {
     /// Default isolation for agents launched against this workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation: Option<IsolationSpec>,
+    // A Workspace-level field, not part of the shared `IsolationSpec`:
+    // `CalibanTaskSpec.isolation` is a per-run override that wins over the
+    // workspace default, so an egress field there would let a task widen the
+    // workspace's restriction (#58). (`//` so this stays out of the CRD.)
+    /// Egress restriction for agent pods. Unset keeps allow-all egress; set, it
+    /// allows DNS plus only the listed destinations. A task cannot override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressSpec>,
+}
+
+/// Workspace-wide egress restriction for agent pods.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressSpec {
+    /// Destinations agent pods may reach besides DNS. This list replaces the
+    /// default allow-all egress: include the workspace's git remotes, its model
+    /// provider endpoints, and gonzalod if used. An empty list allows DNS only.
+    #[serde(default)]
+    pub allow: Vec<EgressRule>,
+}
+
+/// One allowed egress destination.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressRule {
+    /// Destination CIDR, e.g. `10.0.0.0/8` or `2001:db8::/32`.
+    #[schemars(length(min = 1))]
+    pub cidr: String,
+    /// TCP ports allowed to that CIDR. Empty allows every port.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<i32>,
 }
 
 /// A named model provider bound within a workspace.
@@ -207,6 +238,20 @@ pub fn validate_workspace(
         }
     }
 
+    // #58: a malformed allow-list entry would fail every NetworkPolicy apply,
+    // or silently block the destination the user meant to allow.
+    for rule in spec.egress.iter().flat_map(|e| &e.allow) {
+        if let Some(problem) = cidr_problem(&rule.cidr) {
+            return failed(format!("egress cidr '{}': {problem}", rule.cidr));
+        }
+        if let Some(port) = rule.ports.iter().find(|p| !(1..=65535).contains(*p)) {
+            return failed(format!(
+                "egress cidr '{}': port {port} is outside 1-65535",
+                rule.cidr
+            ));
+        }
+    }
+
     let mut seen = std::collections::BTreeSet::new();
     for p in &spec.providers {
         if !seen.insert(p.name.as_str()) {
@@ -231,6 +276,22 @@ pub fn validate_workspace(
     WorkspaceValidation {
         phase: WorkspacePhase::Ready,
         message: None,
+    }
+}
+
+/// Why an egress CIDR is invalid, if it is: it needs an IPv4 or IPv6 address and
+/// a `/prefix` no longer than the address (32 or 128 bits).
+fn cidr_problem(cidr: &str) -> Option<&'static str> {
+    let Some((addr, prefix)) = cidr.split_once('/') else {
+        return Some("missing a /prefix length");
+    };
+    let Ok(ip) = addr.parse::<std::net::IpAddr>() else {
+        return Some("not an IP address");
+    };
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    match prefix.parse::<u8>() {
+        Ok(p) if p <= max => None,
+        _ => Some("prefix length out of range"),
     }
 }
 
@@ -268,6 +329,9 @@ pub struct ResolvedWorkspace {
     /// Workspace default isolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation: Option<IsolationSpec>,
+    /// Workspace egress restriction, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressSpec>,
 }
 
 /// Resolve a `WorkspaceSpec` + optional `providerRef` to a single-provider
@@ -310,6 +374,7 @@ pub fn resolve_workspace(
         },
         env: spec.env.clone(),
         isolation: spec.isolation.clone(),
+        egress: spec.egress.clone(),
     })
 }
 
@@ -331,6 +396,7 @@ mod tests {
             default_provider: default_provider.map(String::from),
             env: vec![],
             isolation: None,
+            egress: None,
         }
     }
 
@@ -358,6 +424,73 @@ mod tests {
         });
         assert_eq!(v.phase, WorkspacePhase::Ready);
         assert!(v.message.is_none());
+    }
+
+    fn egress(cidr: &str, ports: &[i32]) -> EgressSpec {
+        EgressSpec {
+            allow: vec![EgressRule {
+                cidr: cidr.into(),
+                ports: ports.to_vec(),
+            }],
+        }
+    }
+
+    /// #58: the allow-list is workspace-wide and pinned at admission, like the
+    /// rest of the workspace config a task runs against.
+    #[test]
+    fn resolve_pins_the_workspace_egress_allow_list() {
+        let mut spec = spec_with(vec![provider("workers", None)], None);
+        spec.egress = Some(egress("10.0.0.0/8", &[443]));
+        let rw = resolve_workspace(&spec, None).unwrap();
+        assert_eq!(rw.egress.unwrap().allow[0].cidr, "10.0.0.0/8");
+    }
+
+    #[test]
+    fn a_well_formed_egress_allow_list_is_ready() {
+        let mut spec = spec_with(vec![provider("workers", None)], None);
+        spec.egress = Some(EgressSpec {
+            allow: vec![
+                EgressRule {
+                    cidr: "10.0.0.0/8".into(),
+                    ports: vec![443],
+                },
+                EgressRule {
+                    cidr: "2001:db8::/32".into(),
+                    ports: vec![],
+                },
+            ],
+        });
+        let v = validate_workspace(&spec, "/work", |_, _| true);
+        assert_eq!(v.phase, WorkspacePhase::Ready, "{:?}", v.message);
+    }
+
+    /// A malformed rule would otherwise reach the NetworkPolicy and be rejected
+    /// on every apply, or silently block the destination the user meant to allow.
+    #[test]
+    fn a_malformed_egress_cidr_fails_naming_it() {
+        for bad in [
+            "10.0.0.0",
+            "300.1.1.1/8",
+            "10.0.0.0/33",
+            "2001:db8::/129",
+            "example.com/32",
+        ] {
+            let mut spec = spec_with(vec![provider("workers", None)], None);
+            spec.egress = Some(egress(bad, &[]));
+            let v = validate_workspace(&spec, "/work", |_, _| true);
+            assert_eq!(v.phase, WorkspacePhase::Failed, "{bad}");
+            assert!(v.message.unwrap().contains(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_egress_port_fails() {
+        for bad in [0, 70_000] {
+            let mut spec = spec_with(vec![provider("workers", None)], None);
+            spec.egress = Some(egress("10.0.0.0/8", &[bad]));
+            let v = validate_workspace(&spec, "/work", |_, _| true);
+            assert_eq!(v.phase, WorkspacePhase::Failed, "{bad}");
+        }
     }
 
     #[test]
