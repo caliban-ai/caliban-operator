@@ -100,7 +100,9 @@ pub struct TaskSpec {
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelSpec {
-    /// Name of a ConfigMap holding the router config.
+    /// Name of a ConfigMap (same namespace) holding the model router config
+    /// under the key `caliban.toml`. Mounted read-only into the sandbox and
+    /// handed to caliban as `CALIBAN_ROUTER_CONFIG`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_config_ref: Option<String>,
 }

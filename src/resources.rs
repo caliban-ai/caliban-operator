@@ -5,9 +5,9 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, EnvVarSource, PersistentVolumeClaimSpec, PodSpec,
-    PodTemplateSpec, SecretKeySelector, SecretVolumeSource, ServiceAccount, Volume, VolumeMount,
-    VolumeResourceRequirements,
+    ConfigMapVolumeSource, Container, ContainerPort, EnvVar, EnvVarSource,
+    PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, SecretKeySelector, SecretVolumeSource,
+    ServiceAccount, Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -99,6 +99,20 @@ pub fn build_network_policy(t: &CalibanTask, s: &Settings) -> NetworkPolicy {
 
 const WORKSPACE_VOLUME: &str = "workspace";
 
+/// Volume + mount for the ConfigMap named by `spec.model.routerConfigRef` (#44).
+const ROUTER_CONFIG_VOLUME: &str = "router-config";
+const ROUTER_CONFIG_MOUNT: &str = "/etc/caliban/router";
+/// The ConfigMap key caliban loads — the same `caliban.toml` its own discovery
+/// walks for. caliban reads `CALIBAN_ROUTER_CONFIG` as a *path* to this file.
+const ROUTER_CONFIG_KEY: &str = "caliban.toml";
+
+fn router_config_ref(t: &CalibanTask) -> Option<&str> {
+    t.spec
+        .model
+        .as_ref()
+        .and_then(|m| m.router_config_ref.as_deref())
+}
+
 fn env(name: &str, value: String) -> EnvVar {
     EnvVar {
         name: name.to_string(),
@@ -117,13 +131,11 @@ fn caliband_env(t: &CalibanTask, rw: &ResolvedWorkspace) -> Vec<EnvVar> {
     {
         e.push(env("GONZALO_ENDPOINT", ep));
     }
-    if let Some(r) = t
-        .spec
-        .model
-        .as_ref()
-        .and_then(|m| m.router_config_ref.clone())
-    {
-        e.push(env("CALIBAN_ROUTER_CONFIG_REF", r));
+    if router_config_ref(t).is_some() {
+        e.push(env(
+            "CALIBAN_ROUTER_CONFIG",
+            format!("{ROUTER_CONFIG_MOUNT}/{ROUTER_CONFIG_KEY}"),
+        ));
     }
     e.extend(provider_env(&rw.provider));
     for kv in &rw.env {
@@ -333,21 +345,50 @@ pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> S
             ));
             e
         }),
-        volume_mounts: Some(vec![
-            VolumeMount {
-                name: WORKSPACE_VOLUME.to_string(),
-                mount_path: s.workspace_root.clone(),
-                ..Default::default()
-            },
-            VolumeMount {
-                name: TLS_VOLUME.to_string(),
-                mount_path: TLS_MOUNT.to_string(),
-                read_only: Some(true),
-                ..Default::default()
-            },
-        ]),
+        volume_mounts: Some({
+            let mut m = vec![
+                VolumeMount {
+                    name: WORKSPACE_VOLUME.to_string(),
+                    mount_path: s.workspace_root.clone(),
+                    ..Default::default()
+                },
+                VolumeMount {
+                    name: TLS_VOLUME.to_string(),
+                    mount_path: TLS_MOUNT.to_string(),
+                    read_only: Some(true),
+                    ..Default::default()
+                },
+            ];
+            if router_config_ref(t).is_some() {
+                m.push(VolumeMount {
+                    name: ROUTER_CONFIG_VOLUME.to_string(),
+                    mount_path: ROUTER_CONFIG_MOUNT.to_string(),
+                    read_only: Some(true),
+                    ..Default::default()
+                });
+            }
+            m
+        }),
         ..Default::default()
     };
+    let mut volumes = vec![Volume {
+        name: TLS_VOLUME.to_string(),
+        secret: Some(SecretVolumeSource {
+            secret_name: Some(s.session_tls_secret.clone()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }];
+    if let Some(cm) = router_config_ref(t) {
+        volumes.push(Volume {
+            name: ROUTER_CONFIG_VOLUME.to_string(),
+            config_map: Some(ConfigMapVolumeSource {
+                name: cm.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
     let pod_spec = PodSpec {
         containers: vec![container],
         init_containers: clone_init_container(rw, s).map(|c| vec![c]),
@@ -360,14 +401,7 @@ pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> S
             .or_else(|| rw.isolation.as_ref().and_then(|i| i.runtime_class.clone())),
         service_account_name: Some(sa_name(t)),
         automount_service_account_token: Some(false),
-        volumes: Some(vec![Volume {
-            name: TLS_VOLUME.to_string(),
-            secret: Some(SecretVolumeSource {
-                secret_name: Some(s.session_tls_secret.clone()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }]),
+        volumes: Some(volumes),
         ..Default::default()
     };
     let mut sb = Sandbox::new(
@@ -583,7 +617,7 @@ mod tests {
         assert!(!env.iter().any(|e| e.name == "CALIBAN_WORKSPACE_ROOT"));
         assert!(!env.iter().any(|e| e.name == "CALIBAN_WORKSPACE_SOURCES"));
         // No model configured in the default fixture → no router-config env.
-        assert!(!env.iter().any(|e| e.name == "CALIBAN_ROUTER_CONFIG_REF"));
+        assert!(!env.iter().any(|e| e.name == "CALIBAN_ROUTER_CONFIG"));
         // Workspace PVC present.
         let pvcs = sb.spec.volume_claim_templates.unwrap();
         assert_eq!(pvcs[0].metadata.name.as_deref(), Some("workspace"));
@@ -714,8 +748,12 @@ mod tests {
         );
     }
 
+    /// #44: caliban reads `CALIBAN_ROUTER_CONFIG` as a *file path* to a
+    /// `caliban.toml`. Projecting the ConfigMap's name under
+    /// `CALIBAN_ROUTER_CONFIG_REF` reached nothing, so the ConfigMap must be
+    /// mounted and the env must point at the file inside that mount.
     #[test]
-    fn sandbox_projects_router_config_ref_env_when_model_set() {
+    fn sandbox_mounts_router_config_map_and_points_caliban_at_the_file() {
         use crate::crd::ModelSpec;
         let mut t = task();
         t.spec.model = Some(ModelSpec {
@@ -723,9 +761,64 @@ mod tests {
         });
         let sb = build_sandbox(&t, &resolved(), &Settings::default());
         let pod = sb.spec.pod_template.spec.unwrap();
-        let env = pod.containers[0].env.as_ref().unwrap();
-        assert!(env.iter().any(|e| e.name == "CALIBAN_ROUTER_CONFIG_REF"
-            && e.value.as_deref() == Some("caliban-router")));
+
+        let vol = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "router-config")
+            .expect("router-config volume");
+        let cm = vol.config_map.as_ref().expect("ConfigMap volume source");
+        assert_eq!(cm.name, "caliban-router");
+
+        let c = &pod.containers[0];
+        let mount = c
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "router-config")
+            .expect("router-config mount");
+        assert_eq!(mount.mount_path, "/etc/caliban/router");
+        assert_eq!(mount.read_only, Some(true));
+
+        let env = c.env.as_ref().unwrap();
+        let path = env
+            .iter()
+            .find(|e| e.name == "CALIBAN_ROUTER_CONFIG")
+            .and_then(|e| e.value.as_deref())
+            .expect("CALIBAN_ROUTER_CONFIG");
+        assert_eq!(path, "/etc/caliban/router/caliban.toml");
+        assert!(path.starts_with(&format!("{}/", mount.mount_path)));
+        assert!(
+            !env.iter().any(|e| e.name == "CALIBAN_ROUTER_CONFIG_REF"),
+            "the inert _REF name must not be emitted"
+        );
+    }
+
+    #[test]
+    fn sandbox_without_router_config_ref_adds_no_router_volume_or_env() {
+        let sb = build_sandbox(&task(), &resolved(), &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        assert!(!pod
+            .volumes
+            .unwrap_or_default()
+            .iter()
+            .any(|v| v.name == "router-config"));
+        let c = &pod.containers[0];
+        assert!(!c
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|m| m.name == "router-config"));
+        assert!(!c
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|e| e.name.starts_with("CALIBAN_ROUTER_CONFIG")));
     }
 
     #[test]
