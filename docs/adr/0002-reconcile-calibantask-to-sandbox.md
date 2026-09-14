@@ -137,3 +137,11 @@ Forces:
   has an IP, and the Service is ready. An FQDN without that condition stays
   `Provisioning` with no endpoint, and a reported not-ready surfaces as
   `Ready=False` / `SandboxNotReady` carrying agent-sandbox's message.
+- **Allow-all egress could not be tightened** — _resolved (#58)._ The default
+  egress rule above still allows every destination, and remains the default. A
+  Workspace may now declare `spec.egress.allow` (CIDR + optional TCP ports), which
+  replaces allow-all with DNS plus exactly those destinations; an empty list is
+  DNS-only. It is a Workspace-level field rather than part of the shared
+  `IsolationSpec`, because `CalibanTaskSpec.isolation` is a per-run override that
+  wins over the workspace default and would otherwise let a task widen the
+  restriction. Malformed CIDRs and out-of-range ports fail the Workspace.

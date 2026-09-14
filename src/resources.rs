@@ -11,7 +11,7 @@ use k8s_openapi::api::core::v1::{
     VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{
-    NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
+    IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
     NetworkPolicyPort, NetworkPolicySpec,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -85,8 +85,40 @@ fn ingress_peer(s: &Settings) -> NetworkPolicyPeer {
     }
 }
 
-/// Default-deny NetworkPolicy: allow DNS + general egress + caliband-port ingress.
-pub fn build_network_policy(t: &CalibanTask, s: &Settings) -> NetworkPolicy {
+/// Egress rules for the sandbox pod: DNS always, then allow-all (ADR 0002)
+/// unless the workspace declares an allow-list (#58), which replaces allow-all
+/// with exactly the listed destinations.
+fn egress_rules(rw: &ResolvedWorkspace) -> Vec<NetworkPolicyEgressRule> {
+    let mut rules = vec![NetworkPolicyEgressRule {
+        ports: Some(vec![np_port("UDP", 53), np_port("TCP", 53)]),
+        ..Default::default()
+    }];
+    match &rw.egress {
+        None => rules.push(NetworkPolicyEgressRule::default()),
+        Some(egress) => rules.extend(egress.allow.iter().map(|rule| {
+            NetworkPolicyEgressRule {
+                to: Some(vec![NetworkPolicyPeer {
+                    ip_block: Some(IPBlock {
+                        cidr: rule.cidr.clone(),
+                        except: None,
+                    }),
+                    ..Default::default()
+                }]),
+                ports: (!rule.ports.is_empty())
+                    .then(|| rule.ports.iter().map(|p| np_port("TCP", *p)).collect()),
+            }
+        })),
+    }
+    rules
+}
+
+/// Default-deny NetworkPolicy: allow DNS + egress (all, or the workspace's
+/// allow-list) + caliband-port ingress.
+pub fn build_network_policy(
+    t: &CalibanTask,
+    rw: &ResolvedWorkspace,
+    s: &Settings,
+) -> NetworkPolicy {
     NetworkPolicy {
         metadata: child_meta(t, netpol_name(t), common_labels(t)),
         spec: Some(NetworkPolicySpec {
@@ -106,14 +138,9 @@ pub fn build_network_policy(t: &CalibanTask, s: &Settings) -> NetworkPolicy {
                 ]),
                 from: Some(vec![ingress_peer(s)]),
             }]),
-            // Egress: DNS (53 UDP+TCP), then everything else (git/providers).
-            egress: Some(vec![
-                NetworkPolicyEgressRule {
-                    ports: Some(vec![np_port("UDP", 53), np_port("TCP", 53)]),
-                    ..Default::default()
-                },
-                NetworkPolicyEgressRule::default(),
-            ]),
+            // Egress: DNS (53 UDP+TCP), then everything else (git/providers)
+            // unless the workspace restricts it (#58).
+            egress: Some(egress_rules(rw)),
         }),
     }
 }
@@ -503,7 +530,7 @@ pub struct ReconcilePlan {
 pub fn plan(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> ReconcilePlan {
     ReconcilePlan {
         service_account: build_service_account(t),
-        network_policy: build_network_policy(t, s),
+        network_policy: build_network_policy(t, rw, s),
         sandbox: build_sandbox(t, rw, s),
     }
 }
@@ -558,6 +585,7 @@ mod tests {
             },
             env: vec![],
             isolation: None,
+            egress: None,
         }
     }
 
@@ -574,7 +602,7 @@ mod tests {
 
     #[test]
     fn network_policy_is_default_deny_with_dns_and_caliband_ingress() {
-        let np = build_network_policy(&task(), &Settings::default());
+        let np = build_network_policy(&task(), &resolved(), &Settings::default());
         let spec = np.spec.unwrap();
         assert_eq!(
             spec.policy_types.as_ref().unwrap(),
@@ -608,7 +636,7 @@ mod tests {
     fn network_policy_opens_the_per_agent_stream_port_range() {
         // #25: prosperod's per-agent stream dial targets a port drawn from the
         // agent-port-base (7100) upward, which the old policy (8443-only) blocked.
-        let np = build_network_policy(&task(), &Settings::default());
+        let np = build_network_policy(&task(), &resolved(), &Settings::default());
         let ingress = np.spec.unwrap().ingress.unwrap();
         let ports = ingress[0].ports.clone().unwrap();
         // The caliband control port is still allowed as a single port.
@@ -619,6 +647,73 @@ mod tests {
         assert!(ports
             .iter()
             .any(|p| p.port == Some(IntOrString::Int(7100)) && p.end_port == Some(7999)));
+    }
+
+    /// #58: with no workspace egress allow-list, agent pods keep today's
+    /// allow-all egress (ADR 0002).
+    #[test]
+    fn network_policy_without_workspace_egress_keeps_allow_all() {
+        let np = build_network_policy(&task(), &resolved(), &Settings::default());
+        let egress = np.spec.unwrap().egress.unwrap();
+        assert_eq!(egress.len(), 2);
+        assert!(egress[1].to.is_none(), "allow-all destinations");
+    }
+
+    /// #58: a workspace allow-list replaces allow-all with DNS plus exactly the
+    /// listed destinations.
+    #[test]
+    fn workspace_egress_allow_list_replaces_allow_all() {
+        use crate::workspace::{EgressRule, EgressSpec};
+        let mut rw = resolved();
+        rw.egress = Some(EgressSpec {
+            allow: vec![
+                EgressRule {
+                    cidr: "10.0.0.0/8".into(),
+                    ports: vec![443],
+                },
+                EgressRule {
+                    cidr: "140.82.112.0/20".into(),
+                    ports: vec![],
+                },
+            ],
+        });
+        let np = build_network_policy(&task(), &rw, &Settings::default());
+        let egress = np.spec.unwrap().egress.unwrap();
+        assert_eq!(egress.len(), 3, "DNS plus two allow rules");
+        // The only rule without a destination is the DNS rule; allow-all is gone.
+        for rule in &egress {
+            let dns_only = rule
+                .ports
+                .as_ref()
+                .is_some_and(|ps| ps.iter().all(|p| p.port == Some(IntOrString::Int(53))));
+            assert!(rule.to.is_some() || dns_only, "unexpected allow-all rule");
+        }
+        let first = &egress[1];
+        assert_eq!(
+            first.to.as_ref().unwrap()[0]
+                .ip_block
+                .as_ref()
+                .unwrap()
+                .cidr,
+            "10.0.0.0/8"
+        );
+        let ports = first.ports.as_ref().unwrap();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].port, Some(IntOrString::Int(443)));
+        assert_eq!(ports[0].protocol.as_deref(), Some("TCP"));
+        assert!(
+            egress[2].ports.is_none(),
+            "no ports means every port to that CIDR"
+        );
+    }
+
+    #[test]
+    fn an_empty_egress_allow_list_is_dns_only() {
+        use crate::workspace::EgressSpec;
+        let mut rw = resolved();
+        rw.egress = Some(EgressSpec { allow: vec![] });
+        let np = build_network_policy(&task(), &rw, &Settings::default());
+        assert_eq!(np.spec.unwrap().egress.unwrap().len(), 1);
     }
 
     /// #57: the allowed ingress peer is declared, not implied. A configured pod
@@ -635,7 +730,7 @@ mod tests {
             ingress_namespace: Some("caliban-system".to_string()),
             ..Settings::default()
         };
-        let np = build_network_policy(&task(), &s);
+        let np = build_network_policy(&task(), &resolved(), &s);
         let peers = np.spec.unwrap().ingress.unwrap()[0].from.clone().unwrap();
         assert_eq!(peers.len(), 1);
         assert_eq!(

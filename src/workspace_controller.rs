@@ -175,6 +175,7 @@ mod tests {
                 default_provider: None,
                 env: vec![],
                 isolation: None,
+                egress: None,
             },
         );
         ws.metadata.namespace = Some("team-a".into());
