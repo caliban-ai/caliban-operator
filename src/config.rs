@@ -35,6 +35,15 @@ pub struct Settings {
     /// that cert's SAN (the chart's `global.sessionPlane.serverName`). Handed
     /// to caliband so workers can verify the control listener (#32).
     pub session_server_name: String,
+    /// CPU request for the sandbox containers (e.g. `250m`). `None` omits it (#50).
+    pub caliband_cpu_request: Option<String>,
+    /// Memory request for the sandbox containers (e.g. `512Mi`). `None` omits it.
+    pub caliband_memory_request: Option<String>,
+    /// CPU limit for the sandbox containers. Unset by default.
+    pub caliband_cpu_limit: Option<String>,
+    /// Memory limit for the sandbox containers. Unset by default, so a default
+    /// install never OOM-kills an agent on a guessed ceiling.
+    pub caliband_memory_limit: Option<String>,
 }
 
 impl Default for Settings {
@@ -51,6 +60,12 @@ impl Default for Settings {
             session_token_secret: "caliban-session-plane-token".to_string(),
             session_token_key: "token".to_string(),
             session_server_name: "caliband".to_string(),
+            // Requests by default (Burstable QoS, schedulable under quota);
+            // limits opt-in.
+            caliband_cpu_request: Some("250m".to_string()),
+            caliband_memory_request: Some("512Mi".to_string()),
+            caliband_cpu_limit: None,
+            caliband_memory_limit: None,
         }
     }
 }
@@ -59,8 +74,10 @@ impl Settings {
     /// Read settings from `CALIBAND_IMAGE`, `CALIBAND_PORT`, `CALIBAN_AGENT_PORT_BASE`,
     /// `CALIBAN_AGENT_PORT_END`, `CALIBAN_WORKSPACE_ROOT`, `CALIBAN_WORKSPACE_STORAGE`,
     /// `CALIBAN_GIT_IMAGE`, `CALIBAN_SESSION_TLS_SECRET`, `CALIBAN_SESSION_TOKEN_SECRET`,
-    /// `CALIBAN_SESSION_TOKEN_KEY`, `CALIBAN_SESSION_SERVER_NAME`, falling back
-    /// to defaults.
+    /// `CALIBAN_SESSION_TOKEN_KEY`, `CALIBAN_SESSION_SERVER_NAME`,
+    /// `CALIBAND_CPU_REQUEST`, `CALIBAND_MEMORY_REQUEST`, `CALIBAND_CPU_LIMIT`,
+    /// `CALIBAND_MEMORY_LIMIT`, falling back to defaults. An empty resource
+    /// value clears its default (see [`optional_quantity`]).
     pub fn from_env() -> Self {
         let d = Self::default();
         Self {
@@ -89,7 +106,34 @@ impl Settings {
                 .unwrap_or(d.session_token_key),
             session_server_name: std::env::var("CALIBAN_SESSION_SERVER_NAME")
                 .unwrap_or(d.session_server_name),
+            caliband_cpu_request: optional_quantity(
+                std::env::var("CALIBAND_CPU_REQUEST").ok(),
+                d.caliband_cpu_request.as_deref(),
+            ),
+            caliband_memory_request: optional_quantity(
+                std::env::var("CALIBAND_MEMORY_REQUEST").ok(),
+                d.caliband_memory_request.as_deref(),
+            ),
+            caliband_cpu_limit: optional_quantity(
+                std::env::var("CALIBAND_CPU_LIMIT").ok(),
+                d.caliband_cpu_limit.as_deref(),
+            ),
+            caliband_memory_limit: optional_quantity(
+                std::env::var("CALIBAND_MEMORY_LIMIT").ok(),
+                d.caliband_memory_limit.as_deref(),
+            ),
         }
+    }
+}
+
+/// Resolve an optional resource quantity from its env value (#50): unset →
+/// `default`, a value → that value, and an explicitly empty value → `None`, so
+/// an operator can opt out of a default request rather than only override it.
+pub fn optional_quantity(value: Option<String>, default: Option<&str>) -> Option<String> {
+    match value {
+        None => default.map(str::to_string),
+        Some(v) if v.trim().is_empty() => None,
+        Some(v) => Some(v.trim().to_string()),
     }
 }
 
@@ -214,6 +258,31 @@ mod tests {
     #[test]
     fn session_server_name_defaults_to_the_serving_cert_san() {
         assert_eq!(Settings::default().session_server_name, "caliband");
+    }
+
+    /// #50: with no resources block every sandbox pod is BestEffort. Requests
+    /// by default make it Burstable; limits stay opt-in so a default install
+    /// never OOM-kills an agent on a guess.
+    #[test]
+    fn sandbox_resource_defaults_request_but_do_not_limit() {
+        let s = Settings::default();
+        assert_eq!(s.caliband_cpu_request.as_deref(), Some("250m"));
+        assert_eq!(s.caliband_memory_request.as_deref(), Some("512Mi"));
+        assert!(s.caliband_cpu_limit.is_none());
+        assert!(s.caliband_memory_limit.is_none());
+    }
+
+    #[test]
+    fn optional_quantity_env_unset_uses_default_set_overrides_empty_disables() {
+        assert_eq!(optional_quantity(None, Some("250m")), Some("250m".into()));
+        assert_eq!(
+            optional_quantity(Some("1".into()), Some("250m")),
+            Some("1".into())
+        );
+        // An explicitly empty value opts out of the default entirely.
+        assert_eq!(optional_quantity(Some(String::new()), Some("250m")), None);
+        assert_eq!(optional_quantity(Some("  ".into()), None), None);
+        assert_eq!(optional_quantity(None, None), None);
     }
 
     #[test]

@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
     ConfigMapVolumeSource, Container, ContainerPort, EnvVar, EnvVarSource,
-    PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, SecretKeySelector, SecretVolumeSource,
-    ServiceAccount, Volume, VolumeMount, VolumeResourceRequirements,
+    PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, ResourceRequirements, SecretKeySelector,
+    SecretVolumeSource, ServiceAccount, Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -239,6 +239,38 @@ fn clone_init_container(rw: &ResolvedWorkspace, s: &Settings) -> Option<Containe
             mount_path: s.workspace_root.clone(),
             ..Default::default()
         }]),
+        resources: sandbox_resources(s),
+        ..Default::default()
+    })
+}
+
+/// CPU/memory requests and limits for both sandbox containers (#50). Without
+/// them every agent pod is BestEffort QoS: first evicted under node pressure and
+/// refused by namespaces that enforce a ResourceQuota. `None` when nothing is
+/// configured, so the pod carries no empty `resources` block.
+///
+/// The clone init container gets the same values: a pod's effective request is
+/// the max of any init container and the sum of app containers, so this adds
+/// nothing to scheduling while still admitting the init step under quota.
+fn sandbox_resources(s: &Settings) -> Option<ResourceRequirements> {
+    fn quantities(cpu: Option<&str>, memory: Option<&str>) -> Option<BTreeMap<String, Quantity>> {
+        let m: BTreeMap<String, Quantity> = [("cpu", cpu), ("memory", memory)]
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|q| (k.to_string(), Quantity(q.to_string()))))
+            .collect();
+        (!m.is_empty()).then_some(m)
+    }
+    let requests = quantities(
+        s.caliband_cpu_request.as_deref(),
+        s.caliband_memory_request.as_deref(),
+    );
+    let limits = quantities(
+        s.caliband_cpu_limit.as_deref(),
+        s.caliband_memory_limit.as_deref(),
+    );
+    (requests.is_some() || limits.is_some()).then(|| ResourceRequirements {
+        requests,
+        limits,
         ..Default::default()
     })
 }
@@ -369,6 +401,7 @@ pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> S
             }
             m
         }),
+        resources: sandbox_resources(s),
         ..Default::default()
     };
     let mut volumes = vec![Volume {
@@ -680,6 +713,81 @@ mod tests {
         let sb = build_sandbox(&t, &rw, &Settings::default());
         let pod = sb.spec.pod_template.spec.unwrap();
         assert!(pod.init_containers.is_none());
+    }
+
+    /// Both sandbox containers: caliband, then the git-clone init container.
+    fn sandbox_containers(s: &Settings) -> Vec<Container> {
+        let sb = build_sandbox(&task(), &resolved(), s);
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let mut cs = pod.containers;
+        cs.extend(pod.init_containers.expect("init container present"));
+        assert_eq!(cs.len(), 2);
+        cs
+    }
+
+    /// #50: with no `resources` block every sandbox pod is BestEffort QoS —
+    /// first evicted under node pressure and rejected outright by namespaces
+    /// that enforce a ResourceQuota.
+    #[test]
+    fn default_settings_give_both_containers_requests_but_no_limits() {
+        for c in sandbox_containers(&Settings::default()) {
+            let r = c
+                .resources
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no resources block", c.name));
+            let req = r.requests.as_ref().expect("requests");
+            assert_eq!(req.get("cpu"), Some(&Quantity("250m".into())), "{}", c.name);
+            assert_eq!(
+                req.get("memory"),
+                Some(&Quantity("512Mi".into())),
+                "{}",
+                c.name
+            );
+            assert!(
+                r.limits.is_none(),
+                "{}: defaults must not set limits (Burstable, not a surprise OOM)",
+                c.name
+            );
+        }
+    }
+
+    #[test]
+    fn configured_limits_are_applied_to_both_containers() {
+        let s = Settings {
+            caliband_cpu_limit: Some("2".into()),
+            caliband_memory_limit: Some("4Gi".into()),
+            ..Settings::default()
+        };
+        for c in sandbox_containers(&s) {
+            let limits = c
+                .resources
+                .as_ref()
+                .and_then(|r| r.limits.as_ref())
+                .unwrap_or_else(|| panic!("{} has no limits", c.name));
+            assert_eq!(limits.get("cpu"), Some(&Quantity("2".into())), "{}", c.name);
+            assert_eq!(
+                limits.get("memory"),
+                Some(&Quantity("4Gi".into())),
+                "{}",
+                c.name
+            );
+        }
+    }
+
+    #[test]
+    fn with_no_requests_or_limits_the_resources_block_is_omitted() {
+        let s = Settings {
+            caliband_cpu_request: None,
+            caliband_memory_request: None,
+            ..Settings::default()
+        };
+        for c in sandbox_containers(&s) {
+            assert!(
+                c.resources.is_none(),
+                "{}: expected no resources block",
+                c.name
+            );
+        }
     }
 
     #[test]
