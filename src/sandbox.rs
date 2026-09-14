@@ -10,6 +10,8 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::crd::Condition;
+
 /// Desired state of an agent-sandbox `Sandbox` (subset the operator manages).
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[kube(
@@ -61,6 +63,11 @@ pub struct SandboxStatus {
         skip_serializing_if = "Option::is_none"
     )]
     pub service_fqdn: Option<String>,
+    /// Conditions agent-sandbox reports. Its `Ready` is True only once the pod
+    /// is Running, passes its readiness probe, has an IP, and the Service is
+    /// ready — the signal that gates the task's `Running` phase (#45).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
 }
 
 #[cfg(test)]
@@ -114,6 +121,32 @@ mod tests {
         );
         assert!(vct.get("kind").is_none(), "must not emit kind: {vct}");
         assert_eq!(vct["metadata"]["name"], "workspace");
+    }
+
+    /// #45: agent-sandbox v0.5.0 reports readiness as a `metav1.Condition`
+    /// (`Ready`, reason `DependenciesReady`), which also carries
+    /// `lastTransitionTime`/`observedGeneration`. The operator must still parse it.
+    #[test]
+    fn status_reads_ready_condition_with_extra_metav1_fields() {
+        let json = serde_json::json!({
+            "serviceFQDN": "demo-sbx.team-a.svc",
+            "conditions": [{
+                "type": "Ready",
+                "status": "True",
+                "reason": "DependenciesReady",
+                "message": "Pod is Ready",
+                "lastTransitionTime": "2026-09-13T00:00:00Z",
+                "observedGeneration": 1
+            }]
+        });
+        let st: SandboxStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(st.conditions.len(), 1);
+        assert_eq!(st.conditions[0].type_, "Ready");
+        assert_eq!(st.conditions[0].status, "True");
+        assert_eq!(
+            st.conditions[0].reason.as_deref(),
+            Some("DependenciesReady")
+        );
     }
 
     #[test]

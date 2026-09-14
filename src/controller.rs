@@ -49,13 +49,19 @@ pub(crate) fn derive_status(
     sandbox: Option<&Sandbox>,
     s: &Settings,
 ) -> Option<CalibanTaskStatus> {
-    let fqdn = sandbox
-        .and_then(|sb| sb.status.as_ref())
-        .and_then(|st| st.service_fqdn.clone());
+    let sb_status = sandbox.and_then(|sb| sb.status.as_ref());
+    let fqdn = sb_status.and_then(|st| st.service_fqdn.clone());
+    // #45: `serviceFQDN` appears as soon as the Service object exists — before
+    // caliband has bound its port. agent-sandbox's own `Ready` condition is True
+    // only once the pod passes its readiness probe (on the control port) and
+    // the Service is ready, so that, not the FQDN, is what makes a task Running.
+    // No condition yet is not evidence of readiness.
+    let sb_ready = sb_status.and_then(|st| st.conditions.iter().find(|c| c.type_ == "Ready"));
+    let ready = sb_ready.is_some_and(|c| c.status == "True");
     let (phase, endpoint) = match (sandbox, fqdn) {
         (None, _) => (Phase::Pending, None),
-        (Some(_), None) => (Phase::Provisioning, None),
-        (Some(_), Some(f)) => (Phase::Running, Some(format!("{}:{}", f, s.caliband_port))),
+        (Some(_), Some(f)) if ready => (Phase::Running, Some(format!("{}:{}", f, s.caliband_port))),
+        (Some(_), _) => (Phase::Provisioning, None),
     };
     let mut next = t.status.clone().unwrap_or_default();
     next.phase = phase;
@@ -76,6 +82,20 @@ pub(crate) fn derive_status(
             reason: Some("Running".into()),
             message: None,
         }],
+        // A Sandbox that has *reported* not-ready: say so, carrying
+        // agent-sandbox's human-readable detail (e.g. "Pod is Running but not
+        // Ready") so `kubectl describe` shows why the task isn't up yet.
+        Phase::Provisioning => sb_ready
+            .filter(|c| c.status != "True")
+            .map(|c| {
+                vec![Condition {
+                    type_: "Ready".into(),
+                    status: "False".into(),
+                    reason: Some("SandboxNotReady".into()),
+                    message: c.message.clone(),
+                }]
+            })
+            .unwrap_or_default(),
         _ => Vec::new(),
     };
     match &t.status {
@@ -386,7 +406,9 @@ mod tests {
         t
     }
 
-    fn sandbox_with_fqdn(fqdn: Option<&str>) -> Sandbox {
+    /// A Sandbox as agent-sandbox reports it: `fqdn`, plus a `Ready` condition
+    /// with the given status/reason/message when `ready` is `Some`.
+    fn sandbox_status(fqdn: Option<&str>, ready: Option<(&str, &str, &str)>) -> Sandbox {
         let mut sb = Sandbox::new(
             "refactor-auth-sbx",
             SandboxSpec {
@@ -399,8 +421,82 @@ mod tests {
         sb.metadata.namespace = Some("team-a".into());
         sb.status = Some(SandboxStatus {
             service_fqdn: fqdn.map(|f| f.to_string()),
+            conditions: ready
+                .map(|(status, reason, message)| {
+                    vec![Condition {
+                        type_: "Ready".into(),
+                        status: status.into(),
+                        reason: Some(reason.into()),
+                        message: Some(message.into()),
+                    }]
+                })
+                .unwrap_or_default(),
         });
         sb
+    }
+
+    /// A Sandbox with `fqdn` that agent-sandbox reports *ready* whenever it has
+    /// one — the healthy case the pre-#45 tests below describe.
+    fn sandbox_with_fqdn(fqdn: Option<&str>) -> Sandbox {
+        let ready = fqdn.map(|_| ("True", "DependenciesReady", "Pod is Ready"));
+        sandbox_status(fqdn, ready)
+    }
+
+    /// #45: the Service (and so `serviceFQDN`) exists before caliband can
+    /// answer. A Sandbox whose own `Ready` is not True must not make the task
+    /// `Running` — prosperod would dial a dead endpoint.
+    #[test]
+    fn sandbox_with_fqdn_but_not_ready_is_provisioning_with_ready_false() {
+        let t = task_without_status();
+        let sb = sandbox_status(
+            Some("refactor-auth-sbx.team-a.svc"),
+            Some((
+                "False",
+                "DependenciesNotReady",
+                "Pod is Running but not Ready",
+            )),
+        );
+        let d = super::derive_status(&t, Some(&sb), &Settings::default()).unwrap();
+        assert_eq!(d.phase, Phase::Provisioning);
+        assert!(d.caliband_endpoint.is_none(), "no endpoint until ready");
+        assert_eq!(d.conditions.len(), 1);
+        let c = &d.conditions[0];
+        assert_eq!(c.type_, "Ready");
+        assert_eq!(c.status, "False");
+        assert_eq!(c.reason.as_deref(), Some("SandboxNotReady"));
+        assert_eq!(c.message.as_deref(), Some("Pod is Running but not Ready"));
+    }
+
+    #[test]
+    fn sandbox_with_fqdn_and_no_ready_condition_yet_is_provisioning() {
+        // agent-sandbox hasn't computed readiness yet: not evidence of Ready.
+        let t = task_without_status();
+        let sb = sandbox_status(Some("refactor-auth-sbx.team-a.svc"), None);
+        let d = super::derive_status(&t, Some(&sb), &Settings::default()).unwrap();
+        assert_eq!(d.phase, Phase::Provisioning);
+        assert!(d.caliband_endpoint.is_none());
+    }
+
+    #[test]
+    fn running_task_whose_sandbox_loses_readiness_drops_back_to_provisioning() {
+        let mut t = task_without_status();
+        let fqdn = Some("refactor-auth-sbx.team-a.svc");
+        t.status = super::derive_status(&t, Some(&sandbox_with_fqdn(fqdn)), &Settings::default());
+        assert_eq!(t.status.as_ref().unwrap().phase, Phase::Running);
+        // caliband crash-loops: the pod is no longer Ready.
+        let sb = sandbox_status(
+            fqdn,
+            Some((
+                "False",
+                "DependenciesNotReady",
+                "Pod is Running but not Ready",
+            )),
+        );
+        let d = super::derive_status(&t, Some(&sb), &Settings::default())
+            .expect("losing readiness is a status change");
+        assert_eq!(d.phase, Phase::Provisioning);
+        assert!(d.caliband_endpoint.is_none());
+        assert_eq!(d.conditions[0].status, "False");
     }
 
     #[test]
