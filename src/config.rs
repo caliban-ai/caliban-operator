@@ -47,6 +47,15 @@ pub struct Settings {
     /// The cluster's DNS domain, used to build caliband's advertise host
     /// (`{sandbox}.{namespace}.svc.{domain}`). Defaults to `cluster.local` (#54).
     pub cluster_domain: String,
+    /// Labels a pod must carry to reach caliband (#57). Empty admits every pod
+    /// in the peer namespace — the historical same-namespace behaviour.
+    pub ingress_pod_selector: BTreeMap<String, String>,
+    /// Namespace allowed to reach caliband (#57), matched by its
+    /// `kubernetes.io/metadata.name` label. `None` means the task's own.
+    pub ingress_namespace: Option<String>,
+    /// Problems found while reading the environment, reported by
+    /// [`Settings::validate`] at startup (`from_env` itself cannot fail).
+    pub env_errors: Vec<String>,
 }
 
 impl Default for Settings {
@@ -70,6 +79,9 @@ impl Default for Settings {
             caliband_cpu_limit: None,
             caliband_memory_limit: None,
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
+            ingress_pod_selector: BTreeMap::new(),
+            ingress_namespace: None,
+            env_errors: Vec::new(),
         }
     }
 }
@@ -80,11 +92,27 @@ impl Settings {
     /// `CALIBAN_GIT_IMAGE`, `CALIBAN_SESSION_TLS_SECRET`, `CALIBAN_SESSION_TOKEN_SECRET`,
     /// `CALIBAN_SESSION_TOKEN_KEY`, `CALIBAN_SESSION_SERVER_NAME`,
     /// `CALIBAND_CPU_REQUEST`, `CALIBAND_MEMORY_REQUEST`, `CALIBAND_CPU_LIMIT`,
-    /// `CALIBAND_MEMORY_LIMIT`, `CALIBAN_CLUSTER_DOMAIN`, falling back to
-    /// defaults. An empty resource value clears its default (see
-    /// [`optional_quantity`]); a blank cluster domain keeps `cluster.local`.
+    /// `CALIBAND_MEMORY_LIMIT`, `CALIBAN_CLUSTER_DOMAIN`,
+    /// `CALIBAN_INGRESS_POD_SELECTOR`, `CALIBAN_INGRESS_NAMESPACE`, falling back
+    /// to defaults. An empty resource value clears its default (see
+    /// [`optional_quantity`]); a blank cluster domain keeps `cluster.local`; a
+    /// malformed ingress selector is recorded in `env_errors`.
     pub fn from_env() -> Self {
         let d = Self::default();
+        let mut env_errors = Vec::new();
+        let ingress_pod_selector = match parse_selector(
+            &std::env::var("CALIBAN_INGRESS_POD_SELECTOR").unwrap_or_default(),
+        ) {
+            Ok(labels) => labels,
+            Err(e) => {
+                env_errors.push(format!("CALIBAN_INGRESS_POD_SELECTOR: {e}"));
+                BTreeMap::new()
+            }
+        };
+        let ingress_namespace = std::env::var("CALIBAN_INGRESS_NAMESPACE")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         Self {
             caliband_image: std::env::var("CALIBAND_IMAGE").unwrap_or(d.caliband_image),
             caliband_port: std::env::var("CALIBAND_PORT")
@@ -128,6 +156,9 @@ impl Settings {
                 d.caliband_memory_limit.as_deref(),
             ),
             cluster_domain: cluster_domain(std::env::var("CALIBAN_CLUSTER_DOMAIN").ok()),
+            ingress_pod_selector,
+            ingress_namespace,
+            env_errors,
         }
     }
 
@@ -135,6 +166,9 @@ impl Settings {
     /// surfaced only as a NetworkPolicy the API server rejected on every
     /// reconcile; checking once at startup names the offending variable.
     pub fn validate(&self) -> Result<(), String> {
+        if !self.env_errors.is_empty() {
+            return Err(self.env_errors.join("; "));
+        }
         for (name, port) in [
             ("CALIBAND_PORT", self.caliband_port),
             ("CALIBAN_AGENT_PORT_BASE", self.agent_port_base),
@@ -188,6 +222,23 @@ pub fn task_name_problem(t: &CalibanTask) -> Option<String> {
             SERVICE_NAME_MAX - (service.len() - task.len())
         )
     })
+}
+
+/// Parse a `key=value,key2=value2` label selector (#57). Blank yields an empty
+/// map (no narrowing). An entry without `=`, or with an empty key or value, is
+/// an error rather than being skipped, so a typo can't silently widen or drop
+/// the ingress rule.
+pub fn parse_selector(raw: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut labels = BTreeMap::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        match entry.split_once('=') {
+            Some((k, v)) if !k.trim().is_empty() && !v.trim().is_empty() => {
+                labels.insert(k.trim().to_string(), v.trim().to_string());
+            }
+            _ => return Err(format!("bad selector entry '{entry}' (want key=value)")),
+        }
+    }
+    Ok(labels)
 }
 
 /// Kubernetes' default cluster DNS domain.
@@ -471,5 +522,52 @@ mod tests {
         t.metadata.name = Some("a".repeat(60));
         let msg = task_name_problem(&t).expect("a 60-character name is too long");
         assert!(msg.contains("63"), "{msg}");
+    }
+
+    /// #57: the default ingress peer stays exactly what it was — every pod in
+    /// the task's own namespace — so existing installs don't lose access.
+    #[test]
+    fn ingress_defaults_admit_every_pod_in_the_task_namespace() {
+        let s = Settings::default();
+        assert!(s.ingress_pod_selector.is_empty());
+        assert!(s.ingress_namespace.is_none());
+        assert!(s.env_errors.is_empty());
+    }
+
+    #[test]
+    fn ingress_pod_selector_parses_comma_separated_labels() {
+        let m = parse_selector("app.kubernetes.io/name=prosperod, tier=control").unwrap();
+        assert_eq!(
+            m,
+            BTreeMap::from([
+                (
+                    "app.kubernetes.io/name".to_string(),
+                    "prosperod".to_string()
+                ),
+                ("tier".to_string(), "control".to_string()),
+            ])
+        );
+        assert!(parse_selector("").unwrap().is_empty());
+        assert!(parse_selector("  ").unwrap().is_empty());
+    }
+
+    /// A malformed selector must not silently widen or drop the rule.
+    #[test]
+    fn a_malformed_ingress_selector_is_rejected() {
+        assert!(parse_selector("app").is_err());
+        assert!(parse_selector("=prosperod").is_err());
+        assert!(parse_selector("app=").is_err());
+    }
+
+    /// `from_env` can't fail, so bad env values are recorded and rejected at
+    /// startup by `validate`, naming the variable.
+    #[test]
+    fn validate_reports_env_errors() {
+        let s = Settings {
+            env_errors: vec!["CALIBAN_INGRESS_POD_SELECTOR: bad entry 'app'".into()],
+            ..Settings::default()
+        };
+        let err = s.validate().unwrap_err();
+        assert!(err.contains("CALIBAN_INGRESS_POD_SELECTOR"), "{err}");
     }
 }

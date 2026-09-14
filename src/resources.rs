@@ -62,6 +62,29 @@ fn np_port_range(proto: &str, start: i32, end: i32) -> NetworkPolicyPort {
     }
 }
 
+/// The pods allowed to reach caliband (#57), declared rather than implied.
+/// Unconfigured, it is every pod in the task's own namespace (an empty pod
+/// selector and no namespace selector) — the historical behaviour.
+/// `CALIBAN_INGRESS_POD_SELECTOR` narrows it to matching pods;
+/// `CALIBAN_INGRESS_NAMESPACE` admits that namespace instead of the task's own.
+fn ingress_peer(s: &Settings) -> NetworkPolicyPeer {
+    NetworkPolicyPeer {
+        pod_selector: Some(LabelSelector {
+            match_labels: (!s.ingress_pod_selector.is_empty())
+                .then(|| s.ingress_pod_selector.clone()),
+            ..Default::default()
+        }),
+        namespace_selector: s.ingress_namespace.as_ref().map(|ns| LabelSelector {
+            match_labels: Some(BTreeMap::from([(
+                "kubernetes.io/metadata.name".to_string(),
+                ns.clone(),
+            )])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// Default-deny NetworkPolicy: allow DNS + general egress + caliband-port ingress.
 pub fn build_network_policy(t: &CalibanTask, s: &Settings) -> NetworkPolicy {
     NetworkPolicy {
@@ -81,10 +104,7 @@ pub fn build_network_policy(t: &CalibanTask, s: &Settings) -> NetworkPolicy {
                     np_port("TCP", s.caliband_port),
                     np_port_range("TCP", s.agent_port_base, s.agent_port_end),
                 ]),
-                from: Some(vec![NetworkPolicyPeer {
-                    pod_selector: Some(LabelSelector::default()),
-                    ..Default::default()
-                }]),
+                from: Some(vec![ingress_peer(s)]),
             }]),
             // Egress: DNS (53 UDP+TCP), then everything else (git/providers).
             egress: Some(vec![
@@ -599,6 +619,45 @@ mod tests {
         assert!(ports
             .iter()
             .any(|p| p.port == Some(IntOrString::Int(7100)) && p.end_port == Some(7999)));
+    }
+
+    /// #57: the allowed ingress peer is declared, not implied. A configured pod
+    /// selector narrows it; a configured namespace admits that namespace (e.g.
+    /// prosperod deployed elsewhere) instead of only the task's own.
+    #[test]
+    fn network_policy_ingress_peer_follows_configured_selector_and_namespace() {
+        let selector = BTreeMap::from([(
+            "app.kubernetes.io/name".to_string(),
+            "prosperod".to_string(),
+        )]);
+        let s = Settings {
+            ingress_pod_selector: selector.clone(),
+            ingress_namespace: Some("caliban-system".to_string()),
+            ..Settings::default()
+        };
+        let np = build_network_policy(&task(), &s);
+        let peers = np.spec.unwrap().ingress.unwrap()[0].from.clone().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0]
+                .pod_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref(),
+            Some(&selector)
+        );
+        let ns = peers[0]
+            .namespace_selector
+            .as_ref()
+            .expect("namespace selector when a namespace is configured");
+        assert_eq!(
+            ns.match_labels
+                .as_ref()
+                .unwrap()
+                .get("kubernetes.io/metadata.name"),
+            Some(&"caliban-system".to_string())
+        );
     }
 
     #[test]
