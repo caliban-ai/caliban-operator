@@ -104,11 +104,49 @@ pub(crate) fn derive_status(
     }
 }
 
+/// The server-side apply body for a `CalibanTask`'s status (#64, ADR 0005): a
+/// partial object that names its type and carries the operator's status fields.
+pub(crate) fn status_apply_body(status: &CalibanTaskStatus) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": CalibanTask::api_version(&()),
+        "kind": CalibanTask::kind(&()),
+        "status": status,
+    })
+}
+
+/// Condition types the operator owns on `CalibanTask` status. Any other entry
+/// (e.g. prospero's `AgentsSettled`, ADR 0005) belongs to another field manager.
+const OPERATOR_CONDITIONS: &[&str] = &["Ready"];
+
+fn operator_conditions(s: &CalibanTaskStatus) -> Vec<&Condition> {
+    s.conditions
+        .iter()
+        .filter(|c| OPERATOR_CONDITIONS.contains(&c.type_.as_str()))
+        .collect()
+}
+
 fn status_eq(a: &CalibanTaskStatus, b: &CalibanTaskStatus) -> bool {
     a.phase == b.phase
         && a.caliband_endpoint == b.caliband_endpoint
         && a.sandbox_ref.as_ref().map(|r| &r.name) == b.sandbox_ref.as_ref().map(|r| &r.name)
-        && a.conditions == b.conditions
+        // Only the operator's own conditions: another manager's entry on the
+        // observed status would otherwise make every reconcile re-apply.
+        && operator_conditions(a) == operator_conditions(b)
+}
+
+/// Force-apply the operator's status fields under the `caliban-operator` field
+/// manager (#64, ADR 0005). `force` takes ownership from the legacy merge-patch
+/// manager on existing tasks; it cannot steal another component's fields
+/// because the body only ever carries operator-owned ones.
+async fn apply_status(
+    api: &Api<CalibanTask>,
+    name: &str,
+    status: &CalibanTaskStatus,
+) -> Result<(), Error> {
+    let pp = PatchParams::apply("caliban-operator").force();
+    api.patch_status(name, &pp, &Patch::Apply(status_apply_body(status)))
+        .await?;
+    Ok(())
 }
 
 /// Server-side apply `obj` under `name`, force-owned by the operator's field
@@ -205,13 +243,12 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
                     // later this same reconcile (it owns `conditions` and
                     // derives them fresh from the phase), so it need not be
                     // touched here.
-                    let patch = serde_json::json!({
-                        "status": { "resolvedWorkspace": rw }
-                    });
                     let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
-                    task_api
-                        .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
-                        .await?;
+                    let pin = CalibanTaskStatus {
+                        resolved_workspace: Some(rw.clone()),
+                        ..Default::default()
+                    };
+                    apply_status(&task_api, &name, &pin).await?;
                     rw
                 }
                 Admission::Requeue => {
@@ -221,16 +258,18 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
                     return Ok(Action::requeue(Duration::from_secs(10)));
                 }
                 Admission::Fail(reason) => {
-                    let patch = serde_json::json!({
-                        "status": { "phase": Phase::Failed,
-                            "conditions": [{ "type": "Ready", "status": "False",
-                                "reason": "WorkspaceUnresolved",
-                                "message": reason }] }
-                    });
                     let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
-                    task_api
-                        .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
-                        .await?;
+                    let failed = CalibanTaskStatus {
+                        phase: Phase::Failed,
+                        conditions: vec![Condition {
+                            type_: "Ready".into(),
+                            status: "False".into(),
+                            reason: Some("WorkspaceUnresolved".into()),
+                            message: Some(reason),
+                        }],
+                        ..Default::default()
+                    };
+                    apply_status(&task_api, &name, &failed).await?;
                     tracing::warn!(%ns, %name, "workspace unresolved; task Failed");
                     return Ok(Action::requeue(Duration::from_secs(30)));
                 }
@@ -249,13 +288,14 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
 
     // Read the Sandbox back for its status, then derive + patch CalibanTask status.
     let sandbox = sb_api.get_opt(&sandbox_name(&obj)).await?;
-    if let Some(status) = derive_status(&obj, sandbox.as_ref(), s) {
+    if let Some(mut status) = derive_status(&obj, sandbox.as_ref(), s) {
         let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
         let phase = status.phase;
-        let patch = serde_json::json!({ "status": status });
-        task_api
-            .patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
-            .await?;
+        // The pin is an operator-owned field too. Under server-side apply,
+        // omitting it would remove it — and `obj` predates a pin applied
+        // earlier in this same reconcile — so always carry the pinned config.
+        status.resolved_workspace = Some(resolved.clone());
+        apply_status(&task_api, &name, &status).await?;
         tracing::info!(%ns, %name, ?phase, "patched CalibanTask status");
     }
     Ok(Action::requeue(Duration::from_secs(30)))
@@ -590,23 +630,86 @@ mod tests {
         assert!(d.caliband_endpoint.is_none());
     }
 
+    /// A condition another field manager (prospero, ADR 0005) owns on the CR.
+    fn agents_settled() -> Condition {
+        Condition {
+            type_: "AgentsSettled".into(),
+            status: "True".into(),
+            reason: Some("Succeeded".into()),
+            message: None,
+        }
+    }
+
+    /// #64 (ADR 0005): status is written by server-side apply, so the body is a
+    /// partial object that must name its type.
     #[test]
-    fn cleared_endpoint_and_ref_serialize_as_null_for_merge_delete() {
-        // A status with a running endpoint, then cleared back to Pending.
+    fn status_apply_body_names_the_object_type() {
+        let body = super::status_apply_body(&CalibanTaskStatus::default());
+        assert_eq!(body["apiVersion"], "caliban.caliban-ai.dev/v1alpha1");
+        assert_eq!(body["kind"], "CalibanTask");
+        assert!(body["status"].is_object());
+    }
+
+    /// Under server-side apply a manager releases (and the server removes) any
+    /// field it owned but omits — the inverse of merge patch, which needed an
+    /// explicit `null`/`[]`. A cleared endpoint, ref, and condition set must be
+    /// *absent* from the apply, not null.
+    #[test]
+    fn cleared_endpoint_ref_and_conditions_are_omitted_from_the_apply() {
         let mut t = task_without_status();
         let sb = sandbox_with_fqdn(Some("refactor-auth-sbx.team-a.svc"));
         t.status = super::derive_status(&t, Some(&sb), &Settings::default());
         let cleared = super::derive_status(&t, None, &Settings::default()).unwrap();
-        let v = serde_json::to_value(&cleared).unwrap();
-        // Merge-patch needs explicit null (not absent) to delete the stale values.
-        assert!(v.get("calibandEndpoint").is_some_and(|x| x.is_null()));
-        assert!(v.get("sandboxRef").is_some_and(|x| x.is_null()));
-        // Regression guard: a Running->Pending transition must serialize
-        // `conditions` as an explicit empty array, not omit the key. Under
-        // JSON Merge Patch an omitted key is left unchanged server-side, so
-        // if `conditions` were skipped here the stale `Ready=True` condition
-        // would never be cleared and every subsequent reconcile would keep
-        // re-patching (endless churn).
-        assert_eq!(v.get("conditions"), Some(&serde_json::json!([])));
+        let body = super::status_apply_body(&cleared);
+        let st = &body["status"];
+        assert_eq!(st["phase"], "Pending");
+        assert!(st.get("calibandEndpoint").is_none(), "{st}");
+        assert!(st.get("sandboxRef").is_none(), "{st}");
+        assert!(st.get("conditions").is_none(), "{st}");
+    }
+
+    /// The operator force-applies status, so its body must never carry a
+    /// condition another manager owns — force would steal it.
+    #[test]
+    fn the_apply_never_carries_a_condition_the_operator_does_not_own() {
+        let mut t = task_without_status();
+        t.status = Some(CalibanTaskStatus {
+            conditions: vec![agents_settled()],
+            ..Default::default()
+        });
+        let sb = sandbox_with_fqdn(Some("refactor-auth-sbx.team-a.svc"));
+        let d = super::derive_status(&t, Some(&sb), &Settings::default()).unwrap();
+        let body = super::status_apply_body(&d);
+        let types: Vec<&str> = body["status"]["conditions"]
+            .as_array()
+            .expect("operator conditions present")
+            .iter()
+            .map(|c| c["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, vec!["Ready"]);
+    }
+
+    /// Once prospero has applied `AgentsSettled`, the observed conditions never
+    /// equal the operator's own set. Comparing them wholesale would re-apply
+    /// status on every reconcile.
+    #[test]
+    fn a_condition_owned_by_another_manager_does_not_cause_status_churn() {
+        let mut t = task_without_status();
+        let sb = sandbox_with_fqdn(Some("refactor-auth-sbx.team-a.svc"));
+        t.status = super::derive_status(&t, Some(&sb), &Settings::default());
+        t.status.as_mut().unwrap().conditions.push(agents_settled());
+        assert!(super::derive_status(&t, Some(&sb), &Settings::default()).is_none());
+    }
+
+    /// Each field manager owns its own `conditions` entries only if the list is
+    /// a map keyed by `type`; as an atomic list, one apply replaces all of it.
+    #[test]
+    fn task_status_conditions_is_a_map_list_keyed_by_type() {
+        use kube::CustomResourceExt;
+        let crd = serde_json::to_value(CalibanTask::crd()).unwrap();
+        let c = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
+            ["properties"]["conditions"];
+        assert_eq!(c["x-kubernetes-list-type"], "map", "{c}");
+        assert_eq!(c["x-kubernetes-list-map-keys"], serde_json::json!(["type"]));
     }
 }

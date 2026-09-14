@@ -149,7 +149,6 @@ spec:
                 nullable: true
                 type: string
               conditions:
-                default: []
                 description: Standard Kubernetes conditions.
                 items:
                   description: A minimal Kubernetes-style condition.
@@ -173,6 +172,9 @@ spec:
                   - type
                   type: object
                 type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
               phase:
                 default: Pending
                 description: Lifecycle phase.

@@ -164,33 +164,27 @@ pub struct CalibanTaskStatus {
     #[serde(default)]
     pub phase: Phase,
     /// caliband session endpoint (host:port), once the Sandbox is ready.
-    // No `skip_serializing_if` here (unlike most optional status fields):
-    // `derive_status` transitions this back to `None` when the backing
-    // Sandbox disappears, and the status patch uses JSON Merge Patch
-    // (RFC 7396), where an *omitted* key is left unchanged on the server but
-    // an explicit `null` deletes it. Serializing `None` as `null` is required
-    // so a stale endpoint doesn't survive the merge. (`//` not `///` so this
-    // doesn't leak into the generated CRD schema description.)
-    #[serde(default)]
+    // Status is written by server-side apply (#64, ADR 0005): a field the
+    // operator's manager owned but omits from its next apply is removed, so a
+    // cleared value is *omitted*, never serialized as `null`. (`//` not `///`
+    // so this doesn't leak into the generated CRD schema description.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caliband_endpoint: Option<String>,
     /// The agent-sandbox Sandbox backing this task.
-    // See the note on `caliband_endpoint` above: no `skip_serializing_if`,
-    // for the same merge-patch-delete-via-null reason.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_ref: Option<NamedRef>,
     /// Latest checkpoint reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_ref: Option<String>,
     /// Standard Kubernetes conditions.
-    // No `skip_serializing_if` here either (see `caliband_endpoint` above):
-    // `derive_status` sets this to `[]` to clear a stale `Ready` condition
-    // when the phase leaves `Running`. Under JSON Merge Patch, an *omitted*
-    // key is left unchanged server-side, so an empty `Vec` must still
-    // serialize as `"conditions": []` — skipping it here would leave the
-    // stale condition on the server forever (and cause endless reconcile
-    // churn, since the next read would keep disagreeing with what
-    // `derive_status` recomputes).
-    #[serde(default)]
+    // A map-list keyed by `type`, so each field manager owns only its own
+    // entries (ADR 0005): the operator applies `Ready`, prospero applies
+    // `AgentsSettled`, and neither apply replaces the other's condition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend(
+        "x-kubernetes-list-type" = "map",
+        "x-kubernetes-list-map-keys" = ["type"]
+    ))]
     pub conditions: Vec<Condition>,
     /// Resolved workspace config, pinned at admission (immutable run). Set once;
     /// later `Workspace` edits don't re-pin a running task.
