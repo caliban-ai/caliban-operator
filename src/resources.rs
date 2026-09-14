@@ -333,7 +333,7 @@ pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> S
             // Advertise the pod's routable DNS (not the 0.0.0.0 bind) so prosperod
             // can reach the per-agent stream endpoints caliband hands out (#24).
             "--advertise-host".to_string(),
-            caliband_advertise_host(t),
+            caliband_advertise_host(t, s),
             // Pin the per-agent port base so it stays locked to the window the
             // NetworkPolicy opens (#25) — the operator is the single source of truth.
             "--agent-port-base".to_string(),
