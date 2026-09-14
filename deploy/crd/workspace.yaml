@@ -126,7 +126,12 @@ spec:
                       minLength: 1
                       type: string
                     path:
-                      description: Absolute mount path in the pod (e.g. `/work/caliban`).
+                      description: |-
+                        Absolute checkout path in the pod (e.g. `/work/caliban`). Must be a
+                        directory strictly under the operator's workspace root (default
+                        `/work`) and distinct from every other source's path; otherwise the
+                        Workspace goes `Failed`, since a checkout outside the persistent volume
+                        is lost on every restart.
                       minLength: 1
                       type: string
                     ref:

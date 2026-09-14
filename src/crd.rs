@@ -69,7 +69,11 @@ pub struct Source {
     /// Git ref to check out. Defaults to `main`.
     #[serde(default = "default_ref")]
     pub r#ref: String,
-    /// Absolute mount path in the pod (e.g. `/work/caliban`).
+    /// Absolute checkout path in the pod (e.g. `/work/caliban`). Must be a
+    /// directory strictly under the operator's workspace root (default
+    /// `/work`) and distinct from every other source's path; otherwise the
+    /// Workspace goes `Failed`, since a checkout outside the persistent volume
+    /// is lost on every restart.
     #[schemars(length(min = 1))]
     pub path: String,
 }
