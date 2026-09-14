@@ -11,12 +11,14 @@ use k8s_openapi::api::core::v1::ServiceAccount;
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::Action;
+use kube::runtime::events::{Recorder, Reporter};
 use kube::runtime::watcher::Config;
 use kube::runtime::Controller;
 use kube::{Api, Client, Resource, ResourceExt};
 
 use crate::config::{sandbox_name, task_name_problem, Settings};
 use crate::crd::{CalibanTask, CalibanTaskStatus, Condition, NamedRef, Phase};
+use crate::events;
 use crate::resources::plan;
 use crate::sandbox::Sandbox;
 use crate::workspace::resolve_workspace;
@@ -30,6 +32,8 @@ pub struct Context {
     pub client: Client,
     /// Operator settings.
     pub settings: Settings,
+    /// Publishes Kubernetes Events on the tasks it reconciles (#56).
+    pub recorder: Recorder,
 }
 
 /// Derive the CalibanTask status from the task + its backing Sandbox. Returns
@@ -249,6 +253,8 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
             let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
             apply_status(&task_api, &name, &failed).await?;
             tracing::warn!(%ns, %name, %problem, "invalid task name; task Failed");
+            let ev = events::task_failed("InvalidName", &problem);
+            events::publish(&ctx.recorder, &obj.object_ref(&()), ev).await;
         }
         return Ok(Action::await_change());
     }
@@ -303,6 +309,8 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
                         let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
                         apply_status(&task_api, &name, &failed).await?;
                         tracing::warn!(%ns, %name, "workspace unresolved; task Failed");
+                        let ev = events::task_failed("WorkspaceUnresolved", &reason);
+                        events::publish(&ctx.recorder, &obj.object_ref(&()), ev).await;
                     }
                     // Nothing watches the referenced Workspace from here, so keep
                     // re-checking on a short interval: fixing the workspace is
@@ -326,18 +334,29 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
     if let Some(mut status) = derive_status(&obj, Some(&sandbox), s) {
         let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
         let phase = status.phase;
+        let previous = obj.status.as_ref().map(|st| st.phase);
         // The pin is an operator-owned field too. Under server-side apply,
         // omitting it would remove it — and `obj` predates a pin applied
         // earlier in this same reconcile — so always carry the pinned config.
         status.resolved_workspace = Some(resolved.clone());
         apply_status(&task_api, &name, &status).await?;
         tracing::info!(%ns, %name, ?phase, "patched CalibanTask status");
+        if let Some(ev) = events::phase_changed(previous, phase) {
+            events::publish(&ctx.recorder, &obj.object_ref(&()), ev).await;
+        }
     }
     Ok(Action::requeue(RESYNC))
 }
 
-fn error_policy(_obj: Arc<CalibanTask>, err: &Error, _ctx: Arc<Context>) -> Action {
+fn error_policy(obj: Arc<CalibanTask>, err: &Error, ctx: Arc<Context>) -> Action {
     tracing::warn!(error = %err, "reconcile error");
+    // The error policy is synchronous; publish the Warning on its own task so
+    // it never delays the requeue decision (#56).
+    let ev = events::reconcile_error(err);
+    let reference = obj.object_ref(&());
+    tokio::spawn(async move {
+        events::publish(&ctx.recorder, &reference, ev).await;
+    });
     Action::requeue(Duration::from_secs(30))
 }
 
@@ -348,7 +367,18 @@ pub async fn run(client: Client) -> anyhow::Result<()> {
     let settings = Settings::from_env();
     // #49: fail fast on settings that would otherwise break every reconcile.
     settings.validate().map_err(anyhow::Error::msg)?;
-    let ctx = Arc::new(Context { client, settings });
+    let recorder = Recorder::new(
+        client.clone(),
+        Reporter {
+            controller: "caliban-operator".to_string(),
+            instance: std::env::var("CONTROLLER_POD_NAME").ok(),
+        },
+    );
+    let ctx = Arc::new(Context {
+        client,
+        settings,
+        recorder,
+    });
     Controller::new(tasks, Config::default())
         // Watch the Sandboxes we own (#55): a Sandbox status change — becoming
         // Ready, losing readiness — maps back through its controller owner
