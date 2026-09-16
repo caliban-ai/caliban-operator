@@ -89,12 +89,21 @@ pub struct ModelSpec {
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StateSpec {
-    /// gonzalod endpoint the pod uses for shared state.
+    /// gonzalod URL the task's agents use for shared state (e.g.
+    /// `http://gonzalod.storage.svc:8080`). Setting it selects remote storage
+    /// unless `mode` says `local`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gonzalo_endpoint: Option<String>,
-    /// `remote` (shared gonzalod) or `local` (in-pod).
+    /// `remote` (shared gonzalod) or `local` (in-pod filesystem). Defaults to
+    /// `remote` when `gonzaloEndpoint` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Secret holding the gonzalod bearer token, projected into the pod as
+    /// `GONZALO_TOKEN`. Requires remote storage. Use a gonzalod principal scoped
+    /// to this task's namespace: it must not be able to write another namespace
+    /// (such as `fleet`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_ref: Option<crate::workspace::CredentialsRef>,
 }
 
 /// Sandbox isolation configuration.
@@ -224,7 +233,7 @@ spec:
   providerRef: planner
   task: { prompt: "refactor the auth module", agentType: general-purpose }
   model:     { routerConfigRef: caliban-router }
-  state:     { gonzaloEndpoint: gonzalod.storage.svc, mode: remote }
+  state:     { gonzaloEndpoint: "http://gonzalod.storage.svc:8080", mode: remote, tokenRef: { secretName: gonzalo-agent-token, key: token } }
   isolation: { runtimeClass: gvisor, worktrees: per-source }
   resources: { class: standard }
   lifecycle: { idleTimeout: 30m, onDelete: checkpoint }
