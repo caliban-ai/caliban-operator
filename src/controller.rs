@@ -118,9 +118,12 @@ pub(crate) fn derive_status(
             type_: "Ready".into(),
             status: "False".into(),
             reason: Some("AgentsFailed".into()),
-            // prospero's detail (which agent failed, how) reaches `kubectl
-            // describe` instead of only its own logs.
-            message: settled.and_then(|c| c.message.clone()),
+            // prospero's detail, when it gives one, reaches `kubectl describe`.
+            // Its `AgentsSettled` sets no message today (prospero#228), so fall
+            // back rather than show an empty reason.
+            message: settled
+                .and_then(|c| c.message.clone())
+                .or_else(|| Some("one or more agents failed or crashed".to_string())),
         }],
         _ => Vec::new(),
     };
@@ -788,6 +791,19 @@ mod tests {
         assert_eq!(d.conditions[0].status, "False");
         assert_eq!(d.conditions[0].reason.as_deref(), Some("AgentsFailed"));
         assert_eq!(d.conditions[0].message.as_deref(), Some("agent exited 1"));
+    }
+
+    /// prospero's `AgentsSettled` never sets `message` today (prospero#228), so a
+    /// failed task would otherwise show an empty reason in `kubectl describe`.
+    #[test]
+    fn a_failure_without_a_message_gets_a_fallback() {
+        let (t, sb) = task_with_settled(settled("True", "Failed", None));
+        let d = super::derive_status(&t, Some(&sb), &Settings::default()).unwrap();
+        assert_eq!(d.phase, Phase::Failed);
+        assert_eq!(
+            d.conditions[0].message.as_deref(),
+            Some("one or more agents failed or crashed")
+        );
     }
 
     /// An idle interactive task is deliberately *not* settled: prospero reports
