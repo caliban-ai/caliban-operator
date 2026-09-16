@@ -8,5 +8,6 @@ spec:
   providerRef: workers
   task: { prompt: "refactor the auth module", agentType: general-purpose }
   # Optional shared state on a remote gonzalod (#41/#53). tokenRef names a Secret
-  # holding a gonzalod token for a principal scoped to this namespace.
+  # holding a gonzalod token for a principal with read/write on the gonzalod
+  # `caliban` namespace only (no write on `fleet` or `fleet-audit`).
   # state: { gonzaloEndpoint: "http://gonzalod.storage.svc:8080", tokenRef: { secretName: gonzalo-agent-token, key: token } }

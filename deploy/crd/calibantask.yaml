@@ -101,9 +101,10 @@ spec:
                   tokenRef:
                     description: |-
                       Secret holding the gonzalod bearer token, projected into the pod as
-                      `GONZALO_TOKEN`. Requires remote storage. Use a gonzalod principal scoped
-                      to this task's namespace: it must not be able to write another namespace
-                      (such as `fleet`).
+                      `GONZALO_TOKEN`. Requires remote storage. caliban-memory and
+                      caliban-sessions write to the gonzalod `caliban` namespace, so use a
+                      principal with read/write on `caliban` only and no write on `fleet` or
+                      `fleet-audit`.
                     nullable: true
                     properties:
                       key:
@@ -231,7 +232,7 @@ spec:
                           description: One allowed egress destination.
                           properties:
                             cidr:
-                              description: Destination CIDR, e.g. `10.0.0.0/8` or `2001:db8::/32`.
+                              description: Destination CIDR, e.g. `192.0.2.0/24` or `2001:db8::/32`.
                               minLength: 1
                               type: string
                             ports:
