@@ -99,9 +99,10 @@ pub struct StateSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     /// Secret holding the gonzalod bearer token, projected into the pod as
-    /// `GONZALO_TOKEN`. Requires remote storage. Use a gonzalod principal scoped
-    /// to this task's namespace: it must not be able to write another namespace
-    /// (such as `fleet`).
+    /// `GONZALO_TOKEN`. Requires remote storage. caliban-memory and
+    /// caliban-sessions write to the gonzalod `caliban` namespace, so use a
+    /// principal with read/write on `caliban` only and no write on `fleet` or
+    /// `fleet-audit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_ref: Option<crate::workspace::CredentialsRef>,
 }

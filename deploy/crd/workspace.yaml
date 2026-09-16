@@ -54,7 +54,7 @@ spec:
                       description: One allowed egress destination.
                       properties:
                         cidr:
-                          description: Destination CIDR, e.g. `10.0.0.0/8` or `2001:db8::/32`.
+                          description: Destination CIDR, e.g. `192.0.2.0/24` or `2001:db8::/32`.
                           minLength: 1
                           type: string
                         ports:

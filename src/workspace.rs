@@ -99,7 +99,7 @@ pub struct EgressSpec {
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EgressRule {
-    /// Destination CIDR, e.g. `10.0.0.0/8` or `2001:db8::/32`.
+    /// Destination CIDR, e.g. `192.0.2.0/24` or `2001:db8::/32`.
     #[schemars(length(min = 1))]
     pub cidr: String,
     /// TCP ports allowed to that CIDR. Empty allows every port.
