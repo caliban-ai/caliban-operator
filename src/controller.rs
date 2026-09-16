@@ -53,10 +53,26 @@ pub(crate) fn derive_status(
     // No condition yet is not evidence of readiness.
     let sb_ready = sb_status.and_then(|st| st.conditions.iter().find(|c| c.type_ == "Ready"));
     let ready = sb_ready.is_some_and(|c| c.status == "True");
-    let (phase, endpoint) = match (sandbox, fqdn) {
+    let (infrastructure_phase, endpoint) = match (sandbox, fqdn) {
         (None, _) => (Phase::Pending, None),
         (Some(_), Some(f)) if ready => (Phase::Running, Some(format!("{}:{}", f, s.caliband_port))),
         (Some(_), _) => (Phase::Provisioning, None),
+    };
+    // #37: infrastructure cannot tell "agent running" from "agent finished, pod
+    // still up" — only caliband's agent list knows, and the operator never dials
+    // it (ADR 0005). prospero reports that as `AgentsSettled` (prospero#228), and
+    // a settled task's phase is terminal regardless of the Sandbox.
+    let settled = t
+        .status
+        .as_ref()
+        .and_then(|st| st.conditions.iter().find(|c| c.type_ == "AgentsSettled"))
+        .filter(|c| c.status == "True");
+    let phase = match settled.and_then(|c| c.reason.as_deref()) {
+        Some("Succeeded") => Phase::Completed,
+        Some("Failed") => Phase::Failed,
+        // `AgentsActive` (e.g. an idle interactive task) and any reason outside
+        // prospero's contract are not terminal.
+        _ => infrastructure_phase,
     };
     let mut next = t.status.clone().unwrap_or_default();
     next.phase = phase;
@@ -91,6 +107,24 @@ pub(crate) fn derive_status(
                 }]
             })
             .unwrap_or_default(),
+        // Terminal phases (#37): the agents are done, so the task is not Ready.
+        Phase::Completed => vec![Condition {
+            type_: "Ready".into(),
+            status: "False".into(),
+            reason: Some("Completed".into()),
+            message: None,
+        }],
+        Phase::Failed => vec![Condition {
+            type_: "Ready".into(),
+            status: "False".into(),
+            reason: Some("AgentsFailed".into()),
+            // prospero's detail, when it gives one, reaches `kubectl describe`.
+            // Its `AgentsSettled` sets no message today (prospero#228), so fall
+            // back rather than show an empty reason.
+            message: settled
+                .and_then(|c| c.message.clone())
+                .or_else(|| Some("one or more agents failed or crashed".to_string())),
+        }],
         _ => Vec::new(),
     };
     match &t.status {
@@ -713,6 +747,99 @@ mod tests {
         }
     }
 
+    /// A condition as prospero applies it (prospero#228): `AgentsSettled` with a
+    /// `Succeeded` / `Failed` / `AgentsActive` reason.
+    fn settled(status: &str, reason: &str, message: Option<&str>) -> Condition {
+        Condition {
+            type_: "AgentsSettled".into(),
+            status: status.into(),
+            reason: Some(reason.into()),
+            message: message.map(str::to_string),
+        }
+    }
+
+    /// A Running task whose agents prospero has reported on.
+    fn task_with_settled(c: Condition) -> (CalibanTask, Sandbox) {
+        let mut t = task_without_status();
+        let sb = sandbox_with_fqdn(Some("refactor-auth-sbx.team-a.svc"));
+        t.status = super::derive_status(&t, Some(&sb), &Settings::default());
+        t.status.as_mut().unwrap().conditions.push(c);
+        (t, sb)
+    }
+
+    /// #37: infrastructure alone cannot tell "agent running" from "agent
+    /// finished, pod still up", so a finished task reported `Running` forever.
+    /// prospero's `AgentsSettled` is what makes the phase terminal (ADR 0005).
+    #[test]
+    fn agents_settled_succeeded_makes_the_task_completed() {
+        let (t, sb) = task_with_settled(settled("True", "Succeeded", None));
+        let d = super::derive_status(&t, Some(&sb), &Settings::default())
+            .expect("Running -> Completed is a change");
+        assert_eq!(d.phase, Phase::Completed);
+        let ready = &d.conditions[0];
+        assert_eq!(ready.type_, "Ready");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason.as_deref(), Some("Completed"));
+    }
+
+    #[test]
+    fn agents_settled_failed_makes_the_task_failed_with_the_message() {
+        let (t, sb) = task_with_settled(settled("True", "Failed", Some("agent exited 1")));
+        let d = super::derive_status(&t, Some(&sb), &Settings::default())
+            .expect("Running -> Failed is a change");
+        assert_eq!(d.phase, Phase::Failed);
+        assert_eq!(d.conditions[0].status, "False");
+        assert_eq!(d.conditions[0].reason.as_deref(), Some("AgentsFailed"));
+        assert_eq!(d.conditions[0].message.as_deref(), Some("agent exited 1"));
+    }
+
+    /// prospero's `AgentsSettled` never sets `message` today (prospero#228), so a
+    /// failed task would otherwise show an empty reason in `kubectl describe`.
+    #[test]
+    fn a_failure_without_a_message_gets_a_fallback() {
+        let (t, sb) = task_with_settled(settled("True", "Failed", None));
+        let d = super::derive_status(&t, Some(&sb), &Settings::default()).unwrap();
+        assert_eq!(d.phase, Phase::Failed);
+        assert_eq!(
+            d.conditions[0].message.as_deref(),
+            Some("one or more agents failed or crashed")
+        );
+    }
+
+    /// An idle interactive task is deliberately *not* settled: prospero reports
+    /// `AgentsActive`, and the task stays Running with its endpoint.
+    #[test]
+    fn agents_active_leaves_the_task_running() {
+        let (t, sb) = task_with_settled(settled("False", "AgentsActive", None));
+        assert!(
+            super::derive_status(&t, Some(&sb), &Settings::default()).is_none(),
+            "no phase change, so no status write"
+        );
+        assert_eq!(t.status.as_ref().unwrap().phase, Phase::Running);
+    }
+
+    /// Only the two reasons in prospero's contract are terminal; anything else
+    /// leaves the infrastructure-derived phase alone.
+    #[test]
+    fn a_settled_condition_with_an_unknown_reason_keeps_the_infrastructure_phase() {
+        let (t, sb) = task_with_settled(settled("True", "Mysterious", None));
+        assert!(super::derive_status(&t, Some(&sb), &Settings::default()).is_none());
+        assert_eq!(t.status.as_ref().unwrap().phase, Phase::Running);
+    }
+
+    /// Terminal is stable: re-reconciling a Completed task writes nothing.
+    #[test]
+    fn a_completed_task_does_not_churn() {
+        let (mut t, sb) = task_with_settled(settled("True", "Succeeded", None));
+        let mut completed = super::derive_status(&t, Some(&sb), &Settings::default()).unwrap();
+        // The observed status carries both managers' conditions.
+        completed
+            .conditions
+            .push(settled("True", "Succeeded", None));
+        t.status = Some(completed);
+        assert!(super::derive_status(&t, Some(&sb), &Settings::default()).is_none());
+    }
+
     /// #64 (ADR 0005): status is written by server-side apply, so the body is a
     /// partial object that must name its type.
     #[test]
@@ -764,13 +891,18 @@ mod tests {
 
     /// Once prospero has applied `AgentsSettled`, the observed conditions never
     /// equal the operator's own set. Comparing them wholesale would re-apply
-    /// status on every reconcile.
+    /// status on every reconcile. (Uses a non-terminal `AgentsActive` condition:
+    /// since #37 a `Succeeded`/`Failed` one legitimately changes the phase.)
     #[test]
     fn a_condition_owned_by_another_manager_does_not_cause_status_churn() {
         let mut t = task_without_status();
         let sb = sandbox_with_fqdn(Some("refactor-auth-sbx.team-a.svc"));
         t.status = super::derive_status(&t, Some(&sb), &Settings::default());
-        t.status.as_mut().unwrap().conditions.push(agents_settled());
+        t.status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .push(settled("False", "AgentsActive", None));
         assert!(super::derive_status(&t, Some(&sb), &Settings::default()).is_none());
     }
 
