@@ -170,15 +170,9 @@ fn env(name: &str, value: String) -> EnvVar {
 }
 
 fn caliband_env(t: &CalibanTask, rw: &ResolvedWorkspace) -> Vec<EnvVar> {
-    let mut e = vec![];
-    if let Some(ep) = t
-        .spec
-        .state
-        .as_ref()
-        .and_then(|st| st.gonzalo_endpoint.clone())
-    {
-        e.push(env("GONZALO_ENDPOINT", ep));
-    }
+    // Storage settings from `spec.state` (#41/#53). Replaces `GONZALO_ENDPOINT`,
+    // which caliban never read.
+    let mut e = crate::storage::storage_env(t.spec.state.as_ref());
     if router_config_ref(t).is_some() {
         e.push(env(
             "CALIBAN_ROUTER_CONFIG",

@@ -95,3 +95,16 @@ the caliban image's Dockerfile:
 - **`git clone --depth 1 --branch <ref>` accepts branch/tag names only, not commit
   SHAs** — a `ref` set to a raw commit SHA will fail the clone (the CRD's `ref` defaults
   to `main`; SHA-pinning is a follow-up).
+- **`GONZALO_ENDPOINT` was never consumed** — _resolved
+  ([#41](https://github.com/caliban-ai/caliban-operator/issues/41),
+  [#53](https://github.com/caliban-ai/caliban-operator/issues/53))._ Decision 2 kept it as
+  "consumed by the caliban agent runtime", but nothing in caliban reads it: caliban reaches
+  a remote gonzalod only through its `storage.substrate` / `storage.remote.url` /
+  `storage.remote.token_env` settings. (`CALIBAN_ROUTER_CONFIG_REF` was the same kind of
+  mistake, resolved in #44.) caliban
+  [#659](https://github.com/caliban-ai/caliban/issues/659) added environment overrides for
+  those settings, and `spec.state` now projects `CALIBAN_STORAGE_SUBSTRATE` (`local` → `fs`,
+  `remote` → `remote`), `CALIBAN_STORAGE_REMOTE_URL`, and, with `state.tokenRef`,
+  `CALIBAN_STORAGE_REMOTE_TOKEN_ENV=GONZALO_TOKEN` with `GONZALO_TOKEN` from the referenced
+  Secret. The operator sets caliban's settings by environment rather than authoring its
+  settings file (ADR 0005). Requires a caliban build that includes #659.

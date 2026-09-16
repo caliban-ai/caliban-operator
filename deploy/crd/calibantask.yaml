@@ -86,13 +86,38 @@ spec:
                 nullable: true
                 properties:
                   gonzaloEndpoint:
-                    description: gonzalod endpoint the pod uses for shared state.
+                    description: |-
+                      gonzalod URL the task's agents use for shared state (e.g.
+                      `http://gonzalod.storage.svc:8080`). Setting it selects remote storage
+                      unless `mode` says `local`.
                     nullable: true
                     type: string
                   mode:
-                    description: '`remote` (shared gonzalod) or `local` (in-pod).'
+                    description: |-
+                      `remote` (shared gonzalod) or `local` (in-pod filesystem). Defaults to
+                      `remote` when `gonzaloEndpoint` is set.
                     nullable: true
                     type: string
+                  tokenRef:
+                    description: |-
+                      Secret holding the gonzalod bearer token, projected into the pod as
+                      `GONZALO_TOKEN`. Requires remote storage. Use a gonzalod principal scoped
+                      to this task's namespace: it must not be able to write another namespace
+                      (such as `fleet`).
+                    nullable: true
+                    properties:
+                      key:
+                        description: Key within the Secret's data.
+                        minLength: 1
+                        type: string
+                      secretName:
+                        description: Name of the Secret (same namespace).
+                        minLength: 1
+                        type: string
+                    required:
+                    - key
+                    - secretName
+                    type: object
                 type: object
               task:
                 description: The task itself.

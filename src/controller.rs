@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use k8s_openapi::api::core::v1::ServiceAccount;
+use k8s_openapi::api::core::v1::{Secret, ServiceAccount};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::Action;
@@ -21,6 +21,7 @@ use crate::crd::{CalibanTask, CalibanTaskStatus, Condition, NamedRef, Phase};
 use crate::events;
 use crate::resources::plan;
 use crate::sandbox::Sandbox;
+use crate::storage;
 use crate::workspace::resolve_workspace;
 use crate::workspace::Workspace;
 
@@ -291,6 +292,35 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
             events::publish(&ctx.recorder, &obj.object_ref(&()), ev).await;
         }
         return Ok(Action::await_change());
+    }
+
+    // #41/#53: `spec.state` becomes caliban's storage settings. A malformed state
+    // or a missing gonzalod token Secret fails the task with a clear reason,
+    // instead of a pod caliban refuses to start or that cannot authenticate.
+    if let Some(state) = &obj.spec.state {
+        let problem = match storage::state_problem(state) {
+            Some(problem) => Some(problem),
+            None => match &state.token_ref {
+                Some(token_ref) => {
+                    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &ns);
+                    let secret = secrets.get_opt(&token_ref.secret_name).await?;
+                    storage::token_secret_problem(secret.as_ref(), token_ref)
+                }
+                None => None,
+            },
+        };
+        if let Some(problem) = problem {
+            if let Some(failed) = derive_failed_status(&obj, "InvalidState", &problem) {
+                let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
+                apply_status(&task_api, &name, &failed).await?;
+                tracing::warn!(%ns, %name, %problem, "invalid task state; task Failed");
+                let ev = events::task_failed("InvalidState", &problem);
+                events::publish(&ctx.recorder, &obj.object_ref(&()), ev).await;
+            }
+            // Fixable by editing the spec (which triggers a reconcile) or by
+            // creating the Secret (which does not), so keep re-checking.
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
     }
 
     // Pin once: a running task keeps the config it was admitted with. Later
