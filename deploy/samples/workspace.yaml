@@ -17,3 +17,6 @@ spec:
       baseUrl: "http://192.168.1.240:9292/v1"
       model: qwen2.5-coder
   defaultProvider: planner
+  # Optional agent policy (#80, ADR 0006). allowUnattended admits tasks with
+  # permissionPosture: unattended; whoever can edit this Workspace controls it.
+  # agentPolicy: { allowUnattended: true }

@@ -17,6 +17,9 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
+    - jsonPath: .status.permissionPosture
+      name: Posture
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -135,6 +138,17 @@ spec:
                       the pod caliband itself (prospero#163).
                     nullable: true
                     type: boolean
+                  permissionPosture:
+                    description: |-
+                      How the task's agents handle a permission prompt: `supervised` (the
+                      default) sends it to a human to answer; `unattended` runs under a bypass
+                      profile and is only admitted when the Workspace's `agentPolicy` sets
+                      `allowUnattended`. Unset means `supervised`.
+                    enum:
+                    - supervised
+                    - unattended
+                    nullable: true
+                    type: string
                   prompt:
                     description: Initial prompt.
                     minLength: 1
@@ -201,6 +215,15 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              permissionPosture:
+                description: |-
+                  The permission posture the task was admitted with, so an unattended
+                  session is visible from `kubectl get`.
+                enum:
+                - supervised
+                - unattended
+                nullable: true
+                type: string
               phase:
                 default: Pending
                 description: Lifecycle phase.
@@ -218,6 +241,19 @@ spec:
                   later `Workspace` edits don't re-pin a running task.
                 nullable: true
                 properties:
+                  agentPolicy:
+                    description: Workspace agent policy, if any.
+                    nullable: true
+                    properties:
+                      allowUnattended:
+                        default: false
+                        description: |-
+                          Admit tasks whose `permissionPosture` is `unattended`, which run under
+                          a bypass profile with no human answering permission prompts. Defaults
+                          to false. Whoever can edit this Workspace controls it, so limit who has
+                          write access to Workspaces.
+                        type: boolean
+                    type: object
                   egress:
                     description: Workspace egress restriction, if any.
                     nullable: true

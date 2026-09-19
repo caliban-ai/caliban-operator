@@ -10,4 +10,7 @@ spec:
   # Optional shared state on a remote gonzalod (#41/#53). tokenRef names a Secret
   # holding a gonzalod token for a principal with read/write on the gonzalod
   # `caliban` namespace only (no write on `fleet` or `fleet-audit`).
+  # Optional permission posture (#80, ADR 0006): `supervised` (default) or
+  # `unattended`, which needs the Workspace's agentPolicy.allowUnattended.
+  # task: { prompt: "...", permissionPosture: unattended }
   # state: { gonzaloEndpoint: "http://gonzalod.storage.svc:8080", tokenRef: { secretName: gonzalo-agent-token, key: token } }

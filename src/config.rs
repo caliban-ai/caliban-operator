@@ -322,6 +322,7 @@ mod tests {
                     prompt: "hi".into(),
                     agent_type: None,
                     interactive: None,
+                    permission_posture: None,
                 },
                 model: None,
                 state: None,

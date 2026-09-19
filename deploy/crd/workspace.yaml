@@ -28,6 +28,19 @@ spec:
           spec:
             description: 'Desired state of a workspace: sources + named providers + defaults.'
             properties:
+              agentPolicy:
+                description: What agents in this workspace may do. A task cannot override it.
+                nullable: true
+                properties:
+                  allowUnattended:
+                    default: false
+                    description: |-
+                      Admit tasks whose `permissionPosture` is `unattended`, which run under
+                      a bypass profile with no human answering permission prompts. Defaults
+                      to false. Whoever can edit this Workspace controls it, so limit who has
+                      write access to Workspaces.
+                    type: boolean
+                type: object
               defaultProvider:
                 description: |-
                   Provider name agents get when they don't request one. Implicit when

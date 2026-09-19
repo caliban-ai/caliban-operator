@@ -17,7 +17,7 @@ use kube::runtime::Controller;
 use kube::{Api, Client, Resource, ResourceExt};
 
 use crate::config::{sandbox_name, task_name_problem, Settings};
-use crate::crd::{CalibanTask, CalibanTaskStatus, Condition, NamedRef, Phase};
+use crate::crd::{CalibanTask, CalibanTaskStatus, Condition, NamedRef, PermissionPosture, Phase};
 use crate::events;
 use crate::resources::plan;
 use crate::sandbox::Sandbox;
@@ -81,6 +81,9 @@ pub(crate) fn derive_status(
     next.sandbox_ref = sandbox.map(|_| NamedRef {
         name: sandbox_name(t),
     });
+    // #80: only reached once the posture has passed `posture_problem`, so the
+    // requested posture is the effective one.
+    next.permission_posture = Some(t.spec.task.posture());
     // `derive_status` is the single owner of the `Ready` condition and is only
     // ever reached after the workspace has resolved (the fail-fast branch in
     // `reconcile` returns early, before this is called). So any
@@ -159,6 +162,7 @@ fn status_eq(a: &CalibanTaskStatus, b: &CalibanTaskStatus) -> bool {
     a.phase == b.phase
         && a.caliband_endpoint == b.caliband_endpoint
         && a.sandbox_ref.as_ref().map(|r| &r.name) == b.sandbox_ref.as_ref().map(|r| &r.name)
+        && a.permission_posture == b.permission_posture
         // Only the operator's own conditions: another manager's entry on the
         // observed status would otherwise make every reconcile re-apply.
         && operator_conditions(a) == operator_conditions(b)
@@ -235,6 +239,23 @@ pub(crate) enum Admission {
     /// Terminal task-config error — missing workspace, a `Failed` workspace, or
     /// an unresolvable `providerRef`. The string is the human-readable reason.
     Fail(String),
+    /// The workspace resolves, but its agent policy does not permit the
+    /// task's permission posture (#80). The string is the human-readable reason.
+    Deny(String),
+}
+
+/// Why `posture` is not permitted under the pinned workspace, if it isn't
+/// (#80, caliban ADR 0059). `unattended` needs the Workspace's
+/// `agentPolicy.allowUnattended`; `supervised` is always permitted.
+pub(crate) fn posture_problem(
+    posture: PermissionPosture,
+    rw: &crate::workspace::ResolvedWorkspace,
+) -> Option<String> {
+    (posture == PermissionPosture::Unattended && !rw.allows_unattended()).then(|| {
+        "permissionPosture 'unattended' is not permitted: the workspace's \
+         agentPolicy.allowUnattended is not true"
+            .to_string()
+    })
 }
 
 /// Decide whether a `CalibanTask` may pin its `workspaceRef`/`providerRef`.
@@ -245,6 +266,7 @@ pub(crate) fn admit(
     ws: Option<&Workspace>,
     provider_ref: Option<&str>,
     workspace_ref_name: &str,
+    posture: PermissionPosture,
 ) -> Admission {
     let Some(w) = ws else {
         return Admission::Fail(format!("Workspace not found: '{workspace_ref_name}'"));
@@ -262,12 +284,37 @@ pub(crate) fn admit(
             ))
         }
         crate::workspace::WorkspacePhase::Ready => match resolve_workspace(&w.spec, provider_ref) {
-            Ok(rw) => Admission::Pin(Box::new(rw)),
+            // Checked before pinning, so a denied task isn't pinned to the
+            // policy that denied it: allowing it on the Workspace recovers it.
+            Ok(rw) => match posture_problem(posture, &rw) {
+                Some(reason) => Admission::Deny(reason),
+                None => Admission::Pin(Box::new(rw)),
+            },
             Err(reason) => Admission::Fail(reason),
         },
         // Pending: the Workspace controller hasn't validated it yet. Wait.
         crate::workspace::WorkspacePhase::Pending => Admission::Requeue,
     }
+}
+
+/// Mark the task `Failed` with `reason` and `message`, and publish a Warning
+/// Event saying why. A no-op when the task already records this exact failure.
+async fn fail_task(
+    ctx: &Context,
+    obj: &CalibanTask,
+    reason: &str,
+    message: &str,
+) -> Result<(), Error> {
+    if let Some(failed) = derive_failed_status(obj, reason, message) {
+        let ns = obj.namespace().unwrap_or_default();
+        let name = obj.name_any();
+        let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
+        apply_status(&task_api, &name, &failed).await?;
+        tracing::warn!(%ns, %name, %reason, %message, "task Failed");
+        let ev = events::task_failed(reason, message);
+        events::publish(&ctx.recorder, &obj.object_ref(&()), ev).await;
+    }
+    Ok(())
 }
 
 async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, Error> {
@@ -284,13 +331,7 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
     // names are immutable — fail once with a clear reason and wait for the
     // object to change rather than retrying a doomed apply.
     if let Some(problem) = task_name_problem(&obj) {
-        if let Some(failed) = derive_failed_status(&obj, "InvalidName", &problem) {
-            let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
-            apply_status(&task_api, &name, &failed).await?;
-            tracing::warn!(%ns, %name, %problem, "invalid task name; task Failed");
-            let ev = events::task_failed("InvalidName", &problem);
-            events::publish(&ctx.recorder, &obj.object_ref(&()), ev).await;
-        }
+        fail_task(&ctx, &obj, "InvalidName", &problem).await?;
         return Ok(Action::await_change());
     }
 
@@ -310,18 +351,15 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
             },
         };
         if let Some(problem) = problem {
-            if let Some(failed) = derive_failed_status(&obj, "InvalidState", &problem) {
-                let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
-                apply_status(&task_api, &name, &failed).await?;
-                tracing::warn!(%ns, %name, %problem, "invalid task state; task Failed");
-                let ev = events::task_failed("InvalidState", &problem);
-                events::publish(&ctx.recorder, &obj.object_ref(&()), ev).await;
-            }
+            fail_task(&ctx, &obj, "InvalidState", &problem).await?;
             // Fixable by editing the spec (which triggers a reconcile) or by
             // creating the Secret (which does not), so keep re-checking.
             return Ok(Action::requeue(Duration::from_secs(30)));
         }
     }
+
+    // #80: the posture the task asks for; `supervised` when unset.
+    let posture = obj.spec.task.posture();
 
     // Pin once: a running task keeps the config it was admitted with. Later
     // edits to the referenced `Workspace` don't re-pin (or disturb) a running task.
@@ -330,7 +368,17 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
         .as_ref()
         .and_then(|st| st.resolved_workspace.clone())
     {
-        Some(rw) => rw,
+        Some(rw) => {
+            // A pinned task whose spec is edited to `unattended` is checked
+            // against the pinned policy. Failing drops the pin (the Failed
+            // status omits it), so the next reconcile re-admits against the
+            // live Workspace.
+            if let Some(problem) = posture_problem(posture, &rw) {
+                fail_task(&ctx, &obj, "PostureNotPermitted", &problem).await?;
+                return Ok(Action::requeue(Duration::from_secs(30)));
+            }
+            rw
+        }
         None => {
             let ws_api: Api<Workspace> = Api::namespaced(ctx.client.clone(), &ns);
             let ws = ws_api.get_opt(&obj.spec.workspace_ref.name).await?;
@@ -344,6 +392,7 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
                 ws.as_ref(),
                 obj.spec.provider_ref.as_deref(),
                 &obj.spec.workspace_ref.name,
+                posture,
             ) {
                 Admission::Pin(rw) => {
                     let rw = *rw;
@@ -356,9 +405,16 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
                     let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
                     let pin = CalibanTaskStatus {
                         resolved_workspace: Some(rw.clone()),
+                        permission_posture: Some(posture),
                         ..Default::default()
                     };
                     apply_status(&task_api, &name, &pin).await?;
+                    // An unattended session runs with no human answering
+                    // permission prompts: record who let it in (#80).
+                    if posture == PermissionPosture::Unattended {
+                        let ev = events::unattended_admitted(&obj.spec.workspace_ref.name);
+                        events::publish(&ctx.recorder, &obj.object_ref(&()), ev).await;
+                    }
                     rw
                 }
                 Admission::Requeue => {
@@ -368,17 +424,16 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
                     return Ok(Action::requeue(Duration::from_secs(10)));
                 }
                 Admission::Fail(reason) => {
-                    if let Some(failed) = derive_failed_status(&obj, "WorkspaceUnresolved", &reason)
-                    {
-                        let task_api: Api<CalibanTask> = Api::namespaced(ctx.client.clone(), &ns);
-                        apply_status(&task_api, &name, &failed).await?;
-                        tracing::warn!(%ns, %name, "workspace unresolved; task Failed");
-                        let ev = events::task_failed("WorkspaceUnresolved", &reason);
-                        events::publish(&ctx.recorder, &obj.object_ref(&()), ev).await;
-                    }
+                    fail_task(&ctx, &obj, "WorkspaceUnresolved", &reason).await?;
                     // Nothing watches the referenced Workspace from here, so keep
                     // re-checking on a short interval: fixing the workspace is
                     // what recovers this task.
+                    return Ok(Action::requeue(Duration::from_secs(30)));
+                }
+                Admission::Deny(reason) => {
+                    // Recovered the same way: allowing it on the Workspace, or
+                    // editing the task back to `supervised`.
+                    fail_task(&ctx, &obj, "PostureNotPermitted", &reason).await?;
                     return Ok(Action::requeue(Duration::from_secs(30)));
                 }
             }
@@ -468,7 +523,7 @@ mod tests {
     use super::*;
     use crate::crd::{CalibanTaskSpec, TaskSpec, WorkspaceRef};
     use crate::sandbox::{SandboxSpec, SandboxStatus};
-    use crate::workspace::Source;
+    use crate::workspace::{AgentPolicy, Source};
     use crate::workspace::{Provider, Workspace, WorkspacePhase, WorkspaceSpec, WorkspaceStatus};
     use k8s_openapi::api::core::v1::PodTemplateSpec;
 
@@ -494,6 +549,7 @@ mod tests {
                 env: vec![],
                 isolation: None,
                 egress: None,
+                agent_policy: None,
             },
         );
         ws.status = Some(WorkspaceStatus {
@@ -507,7 +563,7 @@ mod tests {
     #[test]
     fn admit_pins_a_ready_workspace() {
         let ws = workspace(WorkspacePhase::Ready, None);
-        match admit(Some(&ws), None, "team-a-ws") {
+        match admit(Some(&ws), None, "team-a-ws", PermissionPosture::Supervised) {
             Admission::Pin(rw) => assert_eq!(rw.provider.name, "workers"),
             other => panic!("expected Pin, got {:?}", std::mem::discriminant(&other)),
         }
@@ -517,7 +573,7 @@ mod tests {
     fn admit_requeues_a_pending_workspace() {
         let ws = workspace(WorkspacePhase::Pending, None);
         assert!(matches!(
-            admit(Some(&ws), None, "team-a-ws"),
+            admit(Some(&ws), None, "team-a-ws", PermissionPosture::Supervised),
             Admission::Requeue
         ));
     }
@@ -528,7 +584,7 @@ mod tests {
             WorkspacePhase::Failed,
             Some("provider 'workers': secret 'k' key 'v' not found"),
         );
-        match admit(Some(&ws), None, "team-a-ws") {
+        match admit(Some(&ws), None, "team-a-ws", PermissionPosture::Supervised) {
             Admission::Fail(msg) => assert_eq!(
                 msg,
                 "workspace 'team-a-ws' not ready: provider 'workers': secret 'k' key 'v' not found"
@@ -539,7 +595,7 @@ mod tests {
 
     #[test]
     fn admit_fails_a_missing_workspace() {
-        match admit(None, None, "gone-ws") {
+        match admit(None, None, "gone-ws", PermissionPosture::Supervised) {
             Admission::Fail(msg) => assert_eq!(msg, "Workspace not found: 'gone-ws'"),
             _ => panic!("expected Fail"),
         }
@@ -548,12 +604,124 @@ mod tests {
     #[test]
     fn admit_fails_a_ready_workspace_with_a_dangling_provider_ref() {
         let ws = workspace(WorkspacePhase::Ready, None);
-        match admit(Some(&ws), Some("nope"), "team-a-ws") {
+        match admit(
+            Some(&ws),
+            Some("nope"),
+            "team-a-ws",
+            PermissionPosture::Supervised,
+        ) {
             Admission::Fail(msg) => {
                 assert_eq!(msg, "providerRef 'nope' names no provider in the workspace")
             }
             _ => panic!("expected Fail"),
         }
+    }
+
+    fn workspace_allowing_unattended(allow: bool) -> Workspace {
+        let mut ws = workspace(WorkspacePhase::Ready, None);
+        ws.spec.agent_policy = Some(AgentPolicy {
+            allow_unattended: allow,
+        });
+        ws
+    }
+
+    #[test]
+    fn admit_denies_unattended_under_a_workspace_without_an_agent_policy() {
+        // Fail-closed (#80, caliban ADR 0059): no policy is not permission.
+        let ws = workspace(WorkspacePhase::Ready, None);
+        match admit(Some(&ws), None, "team-a-ws", PermissionPosture::Unattended) {
+            Admission::Deny(msg) => assert!(msg.contains("allowUnattended"), "{msg}"),
+            _ => panic!("expected Deny"),
+        }
+    }
+
+    #[test]
+    fn admit_denies_unattended_when_the_policy_says_false() {
+        let ws = workspace_allowing_unattended(false);
+        assert!(matches!(
+            admit(Some(&ws), None, "team-a-ws", PermissionPosture::Unattended),
+            Admission::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn admit_pins_unattended_when_the_workspace_allows_it_and_pins_the_policy() {
+        let ws = workspace_allowing_unattended(true);
+        match admit(Some(&ws), None, "team-a-ws", PermissionPosture::Unattended) {
+            // The policy travels with the pin, so later reconciles check the
+            // task against what it was admitted under.
+            Admission::Pin(rw) => assert!(rw.allows_unattended()),
+            _ => panic!("expected Pin"),
+        }
+    }
+
+    #[test]
+    fn supervised_is_admitted_whatever_the_policy() {
+        for ws in [
+            workspace(WorkspacePhase::Ready, None),
+            workspace_allowing_unattended(false),
+        ] {
+            assert!(matches!(
+                admit(Some(&ws), None, "team-a-ws", PermissionPosture::Supervised),
+                Admission::Pin(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_pin_made_before_agent_policy_existed_does_not_allow_unattended() {
+        // Pins written by an older operator carry no `agentPolicy`.
+        let rw: crate::workspace::ResolvedWorkspace = serde_json::from_value(serde_json::json!({
+            "sources": [],
+            "provider": { "name": "workers", "kind": "openai" }
+        }))
+        .unwrap();
+        assert!(super::posture_problem(PermissionPosture::Unattended, &rw).is_some());
+        assert!(super::posture_problem(PermissionPosture::Supervised, &rw).is_none());
+    }
+
+    #[test]
+    fn derived_status_records_the_effective_posture() {
+        let mut t = task_without_status();
+        let sb = sandbox_with_fqdn(Some("refactor-auth-sbx.team-a.svc"));
+        let st = super::derive_status(&t, Some(&sb), &Settings::default()).unwrap();
+        // Unset is reported as the supervised default, not left blank.
+        assert_eq!(st.permission_posture, Some(PermissionPosture::Supervised));
+
+        t.spec.task.permission_posture = Some(PermissionPosture::Unattended);
+        let st = super::derive_status(&t, Some(&sb), &Settings::default()).unwrap();
+        assert_eq!(st.permission_posture, Some(PermissionPosture::Unattended));
+    }
+
+    #[test]
+    fn a_status_missing_the_posture_is_reapplied_once() {
+        // A task admitted by an older operator has no `permissionPosture`; the
+        // first reconcile after upgrade must fill it in, then go quiet.
+        let mut t = task_without_status();
+        let sb = sandbox_with_fqdn(Some("refactor-auth-sbx.team-a.svc"));
+        let mut old = super::derive_status(&t, Some(&sb), &Settings::default()).unwrap();
+        old.permission_posture = None;
+        t.status = Some(old);
+        let next = super::derive_status(&t, Some(&sb), &Settings::default())
+            .expect("a missing posture is a change");
+        t.status = Some(next);
+        assert!(super::derive_status(&t, Some(&sb), &Settings::default()).is_none());
+    }
+
+    #[test]
+    fn a_posture_denial_fails_the_task_and_is_not_reapplied() {
+        let mut t = task_without_status();
+        let msg = "permissionPosture 'unattended' is not permitted";
+        t.status = super::derive_failed_status(&t, "PostureNotPermitted", msg);
+        let st = t.status.as_ref().unwrap();
+        assert_eq!(st.phase, Phase::Failed);
+        assert_eq!(
+            st.conditions[0].reason.as_deref(),
+            Some("PostureNotPermitted")
+        );
+        // A denied task is not running, so it reports no effective posture.
+        assert!(st.permission_posture.is_none());
+        assert!(super::derive_failed_status(&t, "PostureNotPermitted", msg).is_none());
     }
 
     fn task_without_status() -> CalibanTask {
@@ -568,6 +736,7 @@ mod tests {
                     prompt: "hi".into(),
                     agent_type: None,
                     interactive: None,
+                    permission_posture: None,
                 },
                 model: None,
                 state: None,

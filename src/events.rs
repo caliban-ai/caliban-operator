@@ -50,6 +50,20 @@ pub fn task_failed(reason: &str, message: &str) -> Event {
     event(EventType::Warning, reason, "Admit", message)
 }
 
+/// A Normal event for a task admitted with the `unattended` permission posture
+/// (#80): its agents run with no human answering permission prompts, so the
+/// admission, and the Workspace policy that allowed it, is recorded.
+pub fn unattended_admitted(workspace: &str) -> Event {
+    event(
+        EventType::Normal,
+        "UnattendedAdmitted",
+        "Admit",
+        &format!(
+            "admitted with permissionPosture 'unattended': workspace '{workspace}' sets agentPolicy.allowUnattended"
+        ),
+    )
+}
+
 /// A Warning for a reconcile that returned an error.
 pub fn reconcile_error(err: &Error) -> Event {
     event(
@@ -104,6 +118,18 @@ mod tests {
         assert_eq!(ev.type_, EventType::Warning);
         assert_eq!(ev.reason, "InvalidName");
         assert_eq!(ev.note.as_deref(), Some("too long"));
+    }
+
+    #[test]
+    fn an_unattended_admission_is_a_normal_event_naming_the_workspace() {
+        let ev = unattended_admitted("team-a-ws");
+        assert_eq!(ev.type_, EventType::Normal);
+        assert_eq!(ev.reason, "UnattendedAdmitted");
+        let note = ev.note.unwrap();
+        assert!(
+            note.contains("unattended") && note.contains("team-a-ws"),
+            "{note}"
+        );
     }
 
     #[test]
