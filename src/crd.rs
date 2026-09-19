@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
     status = "CalibanTaskStatus",
     shortname = "ctask",
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"Posture","type":"string","jsonPath":".status.permissionPosture"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +73,33 @@ pub struct TaskSpec {
     /// the pod caliband itself (prospero#163).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interactive: Option<bool>,
+    /// How the task's agents handle a permission prompt: `supervised` (the
+    /// default) sends it to a human to answer; `unattended` runs under a bypass
+    /// profile and is only admitted when the Workspace's `agentPolicy` sets
+    /// `allowUnattended`. Unset means `supervised`.
+    // prospero maps this onto `SpawnSpec.permission_posture` (caliban ADR 0059,
+    // caliban#676); the operator never hands it to caliband itself (ADR 0005).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_posture: Option<PermissionPosture>,
+}
+
+// A session's permission posture (caliban ADR 0059). `//`, not `///`: an enum's
+// doc replaces the referencing field's description in the generated CRD.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionPosture {
+    /// A permission prompt goes to a human, who answers it.
+    #[default]
+    Supervised,
+    /// The session runs under an authorized bypass profile.
+    Unattended,
+}
+
+impl TaskSpec {
+    /// The posture this task asks for: `supervised` when unset (fail-closed).
+    pub fn posture(&self) -> PermissionPosture {
+        self.permission_posture.unwrap_or_default()
+    }
 }
 
 /// Model-router configuration.
@@ -174,6 +202,10 @@ pub struct CalibanTaskStatus {
     /// later `Workspace` edits don't re-pin a running task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_workspace: Option<crate::workspace::ResolvedWorkspace>,
+    /// The permission posture the task was admitted with, so an unattended
+    /// session is visible from `kubectl get`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_posture: Option<PermissionPosture>,
 }
 
 /// A by-name reference to another object in the same namespace.
@@ -378,6 +410,59 @@ spec:
         // camelCase key survives re-serialization (prospero reads it back).
         let json = serde_json::to_value(&task.spec).unwrap();
         assert_eq!(json["task"]["interactive"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn crd_schema_restricts_permission_posture_to_its_two_values() {
+        // caliban ADR 0059: the API server must reject anything but the two
+        // postures, so a typo can never reach prospero as an unknown posture.
+        let crd = CalibanTask::crd();
+        let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
+        let task = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"]["task"];
+        let posture = &task["properties"]["permissionPosture"];
+        assert_eq!(
+            posture["enum"],
+            serde_json::json!(["supervised", "unattended"]),
+            "{posture}"
+        );
+        assert!(
+            !task["required"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|f| f == "permissionPosture")),
+            "permissionPosture must stay optional so existing CRs remain valid"
+        );
+    }
+
+    #[test]
+    fn an_unset_posture_is_supervised() {
+        let yaml = r#"
+apiVersion: caliban.caliban-ai.dev/v1alpha1
+kind: CalibanTask
+metadata: { name: m, namespace: n }
+spec:
+  workspaceRef: { name: only-ws }
+  task: { prompt: hi }
+"#;
+        let task: CalibanTask = serde_norway::from_str(yaml).unwrap();
+        assert!(task.spec.task.permission_posture.is_none());
+        assert_eq!(task.spec.task.posture(), PermissionPosture::Supervised);
+    }
+
+    #[test]
+    fn an_unattended_posture_round_trips_in_camel_case() {
+        let yaml = r#"
+apiVersion: caliban.caliban-ai.dev/v1alpha1
+kind: CalibanTask
+metadata: { name: m, namespace: n }
+spec:
+  workspaceRef: { name: only-ws }
+  task: { prompt: hi, permissionPosture: unattended }
+"#;
+        let task: CalibanTask = serde_norway::from_str(yaml).unwrap();
+        assert_eq!(task.spec.task.posture(), PermissionPosture::Unattended);
+        // prospero reads the field back by this exact key and value.
+        let json = serde_json::to_value(&task.spec).unwrap();
+        assert_eq!(json["task"]["permissionPosture"], "unattended");
     }
 
     #[test]

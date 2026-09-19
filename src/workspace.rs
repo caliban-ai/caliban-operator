@@ -82,6 +82,23 @@ pub struct WorkspaceSpec {
     /// allows DNS plus only the listed destinations. A task cannot override it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressSpec>,
+    /// What agents in this workspace may do. A task cannot override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_policy: Option<AgentPolicy>,
+}
+
+// #80 adds the first field; #51 extends this block with the typed caliban
+// governance settings. (`//` so this stays out of the CRD.)
+/// Workspace-wide policy for the agents a task launches.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPolicy {
+    /// Admit tasks whose `permissionPosture` is `unattended`, which run under
+    /// a bypass profile with no human answering permission prompts. Defaults
+    /// to false. Whoever can edit this Workspace controls it, so limit who has
+    /// write access to Workspaces.
+    #[serde(default)]
+    pub allow_unattended: bool,
 }
 
 /// Workspace-wide egress restriction for agent pods.
@@ -332,6 +349,19 @@ pub struct ResolvedWorkspace {
     /// Workspace egress restriction, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressSpec>,
+    /// Workspace agent policy, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_policy: Option<AgentPolicy>,
+}
+
+impl ResolvedWorkspace {
+    /// Whether the pinned policy admits an `unattended` task. A pin without a
+    /// policy (including one made before the field existed) does not.
+    pub fn allows_unattended(&self) -> bool {
+        self.agent_policy
+            .as_ref()
+            .is_some_and(|p| p.allow_unattended)
+    }
 }
 
 /// Resolve a `WorkspaceSpec` + optional `providerRef` to a single-provider
@@ -375,6 +405,7 @@ pub fn resolve_workspace(
         env: spec.env.clone(),
         isolation: spec.isolation.clone(),
         egress: spec.egress.clone(),
+        agent_policy: spec.agent_policy.clone(),
     })
 }
 
@@ -397,6 +428,7 @@ mod tests {
             env: vec![],
             isolation: None,
             egress: None,
+            agent_policy: None,
         }
     }
 
@@ -663,6 +695,28 @@ mod tests {
     /// added later, so `minItems: 1` + `required` on `sources` wrongly blocked
     /// registering one at all (422 from the apiserver). `providers` keeps its
     /// constraint — `resolve` relies on there being a bindable provider.
+    #[test]
+    fn crd_agent_policy_allow_unattended_is_an_optional_boolean_defaulting_false() {
+        // #80: an omitted policy, or one without the switch, must never read
+        // as permission to run unattended.
+        let crd = Workspace::crd();
+        let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
+        let policy = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"]["agentPolicy"];
+        let allow = &policy["properties"]["allowUnattended"];
+        assert_eq!(allow["type"], "boolean", "{policy}");
+        assert_eq!(allow["default"], false, "{policy}");
+
+        let spec: WorkspaceSpec = serde_json::from_value(serde_json::json!({
+            "displayName": "x",
+            "providers": [{ "name": "p", "kind": "openai" }],
+            "agentPolicy": {}
+        }))
+        .unwrap();
+        assert_eq!(spec.agent_policy, Some(AgentPolicy::default()));
+        let rw = resolve_workspace(&spec, None).unwrap();
+        assert!(!rw.allows_unattended());
+    }
+
     #[test]
     fn crd_allows_a_workspace_with_no_sources() {
         let crd = Workspace::crd();
