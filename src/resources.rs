@@ -19,8 +19,14 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::ResourceExt;
 
+// #82: caliband's flag and env names come from caliban's own published contract
+// crate, so a rename in caliban is a compile error here instead of a silent
+// runtime misconfiguration (the root cause of #30, #32/#35 and #44).
+use caliban_contract::launch::{self, CalibandLaunch, CalibandTls, ProviderKind};
+
 use crate::config::{
-    caliband_advertise_host, common_labels, netpol_name, owner_ref, sa_name, sandbox_name, Settings,
+    caliband_advertise_host, common_labels, netpol_name, owner_ref, sa_name, sandbox_name,
+    Settings, DEFAULT_AGENT_PORT_BASE,
 };
 use crate::crd::CalibanTask;
 use crate::sandbox::{Sandbox, SandboxSpec, VolumeClaimTemplate};
@@ -161,6 +167,14 @@ fn router_config_ref(t: &CalibanTask) -> Option<&str> {
         .and_then(|m| m.router_config_ref.as_deref())
 }
 
+/// `Settings.agent_port_base` as the `u16` the launch contract takes.
+/// `Settings::validate` rejects anything outside 1-65535, so the fallback is
+/// unreachable with a validated config; it keeps the default rather than
+/// truncating a bad value into some other pod's port window.
+fn agent_port_base(s: &Settings) -> u16 {
+    u16::try_from(s.agent_port_base).unwrap_or(DEFAULT_AGENT_PORT_BASE)
+}
+
 fn env(name: &str, value: String) -> EnvVar {
     EnvVar {
         name: name.to_string(),
@@ -174,8 +188,11 @@ fn caliband_env(t: &CalibanTask, rw: &ResolvedWorkspace) -> Vec<EnvVar> {
     // which caliban never read.
     let mut e = crate::storage::storage_env(t.spec.state.as_ref());
     if router_config_ref(t).is_some() {
+        // The operator sets this to the *path* of the mounted ConfigMap file
+        // (#44), not inline config, so it renders the env name from the contract
+        // rather than going through `CalibandLaunch::router_config`.
         e.push(env(
-            "CALIBAN_ROUTER_CONFIG",
+            launch::ENV_ROUTER_CONFIG,
             format!("{ROUTER_CONFIG_MOUNT}/{ROUTER_CONFIG_KEY}"),
         ));
     }
@@ -186,20 +203,34 @@ fn caliband_env(t: &CalibanTask, rw: &ResolvedWorkspace) -> Vec<EnvVar> {
     e
 }
 
-/// The env-name prefix caliban reads for a provider kind — the `{PROVIDER}` in
-/// `{PROVIDER}_BASE_URL` / `{PROVIDER}_API_KEY` (#30, caliban#390's acceptance).
-///
-/// Uppercasing the kind is right for `anthropic` and `openai`, but
-/// two kinds are irregular on caliban's side and must be aliased explicitly:
-/// its google provider reads the `GEMINI_*` pair, and its Azure path reads
-/// `AZURE_OPENAI_*`. An unknown kind falls back to the uppercase form, which is
-/// the convention every provider crate follows.
-fn provider_env_prefix(kind: &str) -> String {
+/// The `ProviderKind` a workspace provider `kind` names, when caliban-contract
+/// knows it (#82). The contract carries the exact env names for these, so they
+/// never have to be guessed from the kind string.
+fn provider_kind(kind: &str) -> Option<ProviderKind> {
     match kind.to_ascii_lowercase().as_str() {
-        "google" | "gemini" => "GEMINI".to_string(),
+        "anthropic" => Some(ProviderKind::Anthropic),
+        "openai" => Some(ProviderKind::OpenAi),
+        "google" | "gemini" => Some(ProviderKind::Google),
+        _ => None,
+    }
+}
+
+/// The env names caliban reads a provider's base URL and API key from —
+/// `(base_url, api_key)` (#30, caliban#390's acceptance).
+///
+/// A kind caliban-contract knows takes its exact pair from the contract. For the
+/// rest (e.g. `azure`, `bedrock`, `vertex`), the operator still derives them:
+/// uppercasing is the convention every provider crate follows, except caliban's
+/// Azure path, which reads `AZURE_OPENAI_*`.
+fn provider_env_names(kind: &str) -> (String, String) {
+    if let Some(k) = provider_kind(kind) {
+        return (k.base_url_env().to_string(), k.api_key_env().to_string());
+    }
+    let prefix = match kind.to_ascii_lowercase().as_str() {
         "azure" | "azure-openai" | "azure_openai" => "AZURE_OPENAI".to_string(),
         other => other.to_ascii_uppercase().replace(['-', '.'], "_"),
-    }
+    };
+    (format!("{prefix}_BASE_URL"), format!("{prefix}_API_KEY"))
 }
 
 /// Project a resolved provider to caliband container env. Credentials reach the
@@ -218,14 +249,14 @@ fn provider_env_prefix(kind: &str) -> String {
 /// (caliban#93 verified it is not one; selection travels in the `SpawnSpec`)
 /// but because it is the documented input to a user-configured `apiKeyHelper`.
 pub(crate) fn provider_env(rp: &ResolvedProvider) -> Vec<EnvVar> {
-    let prefix = provider_env_prefix(&rp.kind);
+    let (base_url_env, api_key_env) = provider_env_names(&rp.kind);
     let mut e = vec![env("CALIBAN_PROVIDER", rp.kind.clone())];
     if let Some(u) = &rp.base_url {
-        e.push(env(&format!("{prefix}_BASE_URL"), u.clone()));
+        e.push(env(&base_url_env, u.clone()));
     }
     if let Some(c) = &rp.credentials_ref {
         e.push(EnvVar {
-            name: format!("{prefix}_API_KEY"),
+            name: api_key_env,
             value: None,
             value_from: Some(EnvVarSource {
                 secret_key_ref: Some(SecretKeySelector {
@@ -366,46 +397,55 @@ pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> S
             name: Some("caliband".to_string()),
             ..Default::default()
         }]),
-        args: Some(vec![
-            "--workspace-root".to_string(),
-            s.workspace_root.clone(),
-            "--listen".to_string(),
-            format!("0.0.0.0:{}", s.caliband_port),
-            // Advertise the pod's routable DNS (not the 0.0.0.0 bind) so prosperod
-            // can reach the per-agent stream endpoints caliband hands out (#24).
-            "--advertise-host".to_string(),
-            caliband_advertise_host(t, s),
-            // Pin the per-agent port base so it stays locked to the window the
-            // NetworkPolicy opens (#25) — the operator is the single source of truth.
-            "--agent-port-base".to_string(),
-            s.agent_port_base.to_string(),
-            "--tls-cert".to_string(),
-            format!("{TLS_MOUNT}/tls.crt"),
-            "--tls-key".to_string(),
-            format!("{TLS_MOUNT}/tls.key"),
-            // Hand caliband its own trust anchor (#32). Without a CA it cannot
-            // pass one down to the workers it spawns, so their status reports
-            // fail the handshake and an interactive agent never reaches Idle.
-            // The key is already in the mounted session-plane Secret.
-            "--tls-ca".to_string(),
-            format!("{TLS_MOUNT}/ca.crt"),
-            // ...and the name that CA must vouch for (#35). caliband defaults
-            // this to `--advertise-host` — the per-pod DNS name — but the
-            // serving cert's only SAN is the session-plane name, so the default
-            // is unverifiable here. caliban#510's launcher passes caliband's
-            // resolved name to each worker *explicitly*, overriding whatever the
-            // worker would have inherited from `CALIBAN_CONTROL_TLS_SERVER_NAME`
-            // in the pod env below. That makes argv the value that actually
-            // wins: setting only the env var leaves workers verifying against a
-            // name the cert cannot prove, the handshake fails, and — the status
-            // sink being best-effort — every Idle report is silently dropped.
-            "--tls-server-name".to_string(),
-            s.session_server_name.clone(),
-        ]),
+        // #82: the flag names come from `caliban-contract`, so a renamed or
+        // removed caliband flag is a compile error here rather than a pod that
+        // starts and misbehaves.
+        args: Some(
+            CalibandLaunch {
+                listen: Some(format!("0.0.0.0:{}", s.caliband_port)),
+                // Advertise the pod's routable DNS (not the 0.0.0.0 bind) so
+                // prosperod can reach the per-agent stream endpoints caliband
+                // hands out (#24).
+                advertise_host: Some(caliband_advertise_host(t, s)),
+                // Pin the per-agent port base so it stays locked to the window
+                // the NetworkPolicy opens (#25) — the operator is the single
+                // source of truth.
+                agent_port_base: Some(agent_port_base(s)),
+                tls: Some(CalibandTls {
+                    cert: format!("{TLS_MOUNT}/tls.crt").into(),
+                    key: format!("{TLS_MOUNT}/tls.key").into(),
+                    // Hand caliband its own trust anchor (#32). Without a CA it
+                    // cannot pass one down to the workers it spawns, so their
+                    // status reports fail the handshake and an interactive agent
+                    // never reaches Idle. The key is already in the mounted
+                    // session-plane Secret.
+                    ca: Some(format!("{TLS_MOUNT}/ca.crt").into()),
+                    // ...and the name that CA must vouch for (#35). caliband
+                    // defaults this to `--advertise-host` — the per-pod DNS name
+                    // — but the serving cert's only SAN is the session-plane
+                    // name, so the default is unverifiable here. caliban#510's
+                    // launcher passes caliband's resolved name to each worker
+                    // *explicitly*, overriding whatever the worker would have
+                    // inherited from `CALIBAN_CONTROL_TLS_SERVER_NAME` in the pod
+                    // env below. That makes argv the value that actually wins:
+                    // setting only the env var leaves workers verifying against a
+                    // name the cert cannot prove, the handshake fails, and — the
+                    // status sink being best-effort — every Idle report is
+                    // silently dropped.
+                    server_name: Some(s.session_server_name.clone()),
+                }),
+                // The token is never an argv value: it reaches the pod from the
+                // session-plane Secret through `ENV_DAEMON_TOKEN` below, so it
+                // stays out of `kubectl get pod -o yaml` and the process table.
+                token: None,
+                ..CalibandLaunch::new(s.workspace_root.clone())
+            }
+            .args(),
+        ),
         env: Some({
             let mut e = caliband_env(t, rw);
             e.push(EnvVar {
-                name: "CALIBAN_DAEMON_TOKEN".to_string(),
+                name: launch::ENV_DAEMON_TOKEN.to_string(),
                 value: None,
                 value_from: Some(EnvVarSource {
                     secret_key_ref: Some(SecretKeySelector {
@@ -1375,6 +1415,85 @@ mod tests {
         assert!(env.iter().any(|e| e.name == "GEMINI_BASE_URL"));
         assert!(env.iter().any(|e| e.name == "GEMINI_API_KEY"));
         assert!(!env.iter().any(|e| e.name == "GOOGLE_BASE_URL"));
+    }
+
+    /// #82: for every kind caliban-contract knows, the operator must project
+    /// exactly the contract's env names. Asserting against the contract (not
+    /// literals) is what makes a rename in caliban fail here.
+    #[test]
+    fn known_provider_kinds_take_their_env_names_from_the_contract() {
+        for (kind, expected) in [
+            ("anthropic", ProviderKind::Anthropic),
+            ("openai", ProviderKind::OpenAi),
+            ("google", ProviderKind::Google),
+            ("gemini", ProviderKind::Google),
+        ] {
+            assert_eq!(
+                provider_env_names(kind),
+                (
+                    expected.base_url_env().to_string(),
+                    expected.api_key_env().to_string()
+                ),
+                "kind '{kind}'"
+            );
+        }
+    }
+
+    /// A kind the contract doesn't carry keeps the operator's own derivation,
+    /// so a workspace can still bind e.g. an Azure or Bedrock provider.
+    #[test]
+    fn unknown_provider_kinds_keep_the_derived_env_names() {
+        assert_eq!(
+            provider_env_names("azure"),
+            (
+                "AZURE_OPENAI_BASE_URL".into(),
+                "AZURE_OPENAI_API_KEY".into()
+            )
+        );
+        assert_eq!(
+            provider_env_names("bedrock"),
+            ("BEDROCK_BASE_URL".into(), "BEDROCK_API_KEY".into())
+        );
+    }
+
+    /// #82: the rendered argv must use the contract's flag names, and the
+    /// daemon token must never appear there — it arrives via `secretKeyRef`.
+    #[test]
+    fn caliband_args_use_contract_flag_names_and_omit_the_token() {
+        let (t, rw, s) = (task(), resolved(), Settings::default());
+        let sb = build_sandbox(&t, &rw, &s);
+        let args = sb.spec.pod_template.spec.as_ref().unwrap().containers[0]
+            .args
+            .clone()
+            .unwrap();
+        for flag in [
+            launch::FLAG_WORKSPACE_ROOT,
+            launch::FLAG_LISTEN,
+            launch::FLAG_ADVERTISE_HOST,
+            launch::FLAG_AGENT_PORT_BASE,
+            launch::FLAG_TLS_CERT,
+            launch::FLAG_TLS_KEY,
+            launch::FLAG_TLS_CA,
+            launch::FLAG_TLS_SERVER_NAME,
+        ] {
+            assert!(args.iter().any(|a| a == flag), "missing {flag}: {args:?}");
+        }
+        assert!(
+            !args.iter().any(|a| a == launch::FLAG_TOKEN),
+            "the daemon token must not reach argv: {args:?}"
+        );
+        let env = sb.spec.pod_template.spec.as_ref().unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap();
+        let token = env
+            .iter()
+            .find(|e| e.name == launch::ENV_DAEMON_TOKEN)
+            .expect("token env");
+        assert!(
+            token.value.is_none() && token.value_from.is_some(),
+            "the token must come from a secretKeyRef, not an inline value"
+        );
     }
 
     #[test]

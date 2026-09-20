@@ -58,12 +58,15 @@ pub struct Settings {
     pub env_errors: Vec<String>,
 }
 
+/// Default bottom of the per-agent stream port window.
+pub const DEFAULT_AGENT_PORT_BASE: u16 = 7100;
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             caliband_image: "ghcr.io/caliban-ai/caliban:latest".to_string(),
             caliband_port: 8443,
-            agent_port_base: 7100,
+            agent_port_base: DEFAULT_AGENT_PORT_BASE.into(),
             agent_port_end: 7999,
             workspace_root: "/work".to_string(),
             workspace_storage: "10Gi".to_string(),
