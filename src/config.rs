@@ -25,6 +25,16 @@ pub struct Settings {
     pub workspace_storage: String,
     /// Container image for the git-clone init container that populates the workspace.
     pub git_image: String,
+    /// uid every container in the sandbox pod runs as, the git-clone init
+    /// container included (#79). It must match the caliband image's user —
+    /// caliban's Dockerfile creates `app` with `useradd --uid 10001` — or the
+    /// agent cannot use the sources the clone step wrote. One setting, applied
+    /// once to the pod, so the clone step and the agent cannot drift apart.
+    pub agent_uid: i64,
+    /// gid for the same, and the pod's `fsGroup`: kubelet applies it to the
+    /// mounted workspace volume with `g+rwX`, so a non-root clone succeeds
+    /// whatever mode the provisioner gave the volume root.
+    pub agent_gid: i64,
     /// Name of the shared TLS serving-cert Secret (keys tls.crt/tls.key/ca.crt).
     pub session_tls_secret: String,
     /// Name of the shared bearer-token Secret.
@@ -61,6 +71,10 @@ pub struct Settings {
 /// Default bottom of the per-agent stream port window.
 pub const DEFAULT_AGENT_PORT_BASE: u16 = 7100;
 
+/// Default uid and gid for the sandbox pod: the `app` user caliban's Dockerfile
+/// creates (`useradd --uid 10001`), which caliband and the agent worker run as.
+pub const DEFAULT_AGENT_UID: i64 = 10001;
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -71,6 +85,8 @@ impl Default for Settings {
             workspace_root: "/work".to_string(),
             workspace_storage: "10Gi".to_string(),
             git_image: "alpine/git:latest".to_string(),
+            agent_uid: DEFAULT_AGENT_UID,
+            agent_gid: DEFAULT_AGENT_UID,
             session_tls_secret: "caliban-session-plane-tls".to_string(),
             session_token_secret: "caliban-session-plane-token".to_string(),
             session_token_key: "token".to_string(),
@@ -134,6 +150,14 @@ impl Settings {
             workspace_storage: std::env::var("CALIBAN_WORKSPACE_STORAGE")
                 .unwrap_or(d.workspace_storage),
             git_image: std::env::var("CALIBAN_GIT_IMAGE").unwrap_or(d.git_image),
+            agent_uid: std::env::var("CALIBAN_AGENT_UID")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.agent_uid),
+            agent_gid: std::env::var("CALIBAN_AGENT_GID")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.agent_gid),
             session_tls_secret: std::env::var("CALIBAN_SESSION_TLS_SECRET")
                 .unwrap_or(d.session_tls_secret),
             session_token_secret: std::env::var("CALIBAN_SESSION_TOKEN_SECRET")
@@ -179,6 +203,20 @@ impl Settings {
         ] {
             if !(1..=65535).contains(&port) {
                 return Err(format!("{name} {port} is outside 1-65535"));
+            }
+        }
+        // The sandbox pod sets `runAsNonRoot` (#79), so uid 0 would fail every
+        // task at kubelet admission instead of here, where the message names
+        // the variable that caused it.
+        for (name, id) in [
+            ("CALIBAN_AGENT_UID", self.agent_uid),
+            ("CALIBAN_AGENT_GID", self.agent_gid),
+        ] {
+            if !(1..=i64::from(u32::MAX)).contains(&id) {
+                return Err(format!(
+                    "{name} {id} is outside 1-{}: the sandbox pod runs as non-root",
+                    u32::MAX
+                ));
             }
         }
         if self.agent_port_base > self.agent_port_end {
@@ -561,6 +599,42 @@ mod tests {
         assert!(parse_selector("app").is_err());
         assert!(parse_selector("=prosperod").is_err());
         assert!(parse_selector("app=").is_err());
+    }
+
+    /// #79: the sandbox pod sets `runAsNonRoot`, so a root uid would surface
+    /// only later as a kubelet admission failure on every task. Reject it at
+    /// startup, where the message names the variable.
+    #[test]
+    fn a_root_agent_uid_or_gid_is_rejected() {
+        for (field, s) in [
+            (
+                "CALIBAN_AGENT_UID",
+                Settings {
+                    agent_uid: 0,
+                    ..Settings::default()
+                },
+            ),
+            (
+                "CALIBAN_AGENT_GID",
+                Settings {
+                    agent_gid: 0,
+                    ..Settings::default()
+                },
+            ),
+        ] {
+            let err = s.validate().unwrap_err();
+            assert!(err.contains(field), "{err}");
+        }
+    }
+
+    /// The default must match the caliban image's `app` user
+    /// (`useradd --uid 10001` in caliban's Dockerfile) — if they disagree the
+    /// agent cannot read its own workspace.
+    #[test]
+    fn the_default_agent_uid_matches_the_caliban_image_user() {
+        let s = Settings::default();
+        assert_eq!(s.agent_uid, 10001);
+        assert_eq!(s.agent_gid, 10001);
     }
 
     /// `from_env` can't fail, so bad env values are recorded and rejected at
