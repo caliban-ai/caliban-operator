@@ -260,6 +260,31 @@ spec:
                           only admitted when `allowUnattended` is true. Unset projects nothing.
                         nullable: true
                         type: boolean
+                      blockedMarketplaces:
+                        description: Marketplace names to block. Unset blocks none.
+                        items:
+                          type: string
+                        nullable: true
+                        type: array
+                      enabledPlugins:
+                        description: |-
+                          Plugin names to enable; every other discovered plugin is disabled. An
+                          empty list enables none of them, which is different from leaving the
+                          field unset — unset enables everything discovered.
+                        items:
+                          type: string
+                        nullable: true
+                        type: array
+                      noHooks:
+                        description: |-
+                          Bypass every external hook handler. caliban's in-process hooks still
+                          run. Unset leaves caliban's default.
+                        nullable: true
+                        type: boolean
+                      noMcp:
+                        description: Disable MCP server discovery. Unset leaves caliban's default.
+                        nullable: true
+                        type: boolean
                       noPermissions:
                         description: |-
                           Disable permission gating altogether, allowing every tool call. The
@@ -267,6 +292,25 @@ spec:
                           true. Unset projects nothing.
                         nullable: true
                         type: boolean
+                      noSkills:
+                        description: Disable skill discovery at startup. Unset leaves caliban's default.
+                        nullable: true
+                        type: boolean
+                      noSubAgent:
+                        description: |-
+                          Disable the built-in agent tool, so an agent cannot spawn sub-agents.
+                          Unset leaves caliban's default.
+                        nullable: true
+                        type: boolean
+                      parallelToolLimit:
+                        description: |-
+                          Maximum concurrent tool invocations per turn. At least 1 — caliban
+                          reads this as a non-zero integer and refuses 0 at startup. Unset leaves
+                          caliban's default of one less than the CPU count.
+                        format: uint32
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
                       permissionMode:
                         description: |-
                           Initial permission mode for every agent in this workspace. Unset leaves
@@ -283,6 +327,12 @@ spec:
                         - null
                         nullable: true
                         type: string
+                      strictKnownMarketplaces:
+                        description: |-
+                          Block plugin installs from marketplaces caliban doesn't recognise.
+                          Unset leaves caliban's default.
+                        nullable: true
+                        type: boolean
                     type: object
                   egress:
                     description: Workspace egress restriction, if any.

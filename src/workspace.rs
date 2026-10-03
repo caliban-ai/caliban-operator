@@ -117,6 +117,38 @@ pub struct AgentPolicy {
     /// true. Unset projects nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_permissions: Option<bool>,
+    /// Disable MCP server discovery. Unset leaves caliban's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_mcp: Option<bool>,
+    /// Bypass every external hook handler. caliban's in-process hooks still
+    /// run. Unset leaves caliban's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_hooks: Option<bool>,
+    /// Disable skill discovery at startup. Unset leaves caliban's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_skills: Option<bool>,
+    /// Disable the built-in agent tool, so an agent cannot spawn sub-agents.
+    /// Unset leaves caliban's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_sub_agent: Option<bool>,
+    /// Block plugin installs from marketplaces caliban doesn't recognise.
+    /// Unset leaves caliban's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_known_marketplaces: Option<bool>,
+    /// Plugin names to enable; every other discovered plugin is disabled. An
+    /// empty list enables none of them, which is different from leaving the
+    /// field unset — unset enables everything discovered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_plugins: Option<Vec<String>>,
+    /// Marketplace names to block. Unset blocks none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_marketplaces: Option<Vec<String>>,
+    /// Maximum concurrent tool invocations per turn. At least 1 — caliban
+    /// reads this as a non-zero integer and refuses 0 at startup. Unset leaves
+    /// caliban's default of one less than the CPU count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub parallel_tool_limit: Option<u32>,
 }
 
 // caliban's permission modes, as `CALIBAN_DEFAULT_PERMISSION_MODE` accepts
@@ -872,6 +904,60 @@ mod tests {
         };
         assert!(supervised.unsupervised_settings().is_empty());
         assert!(AgentPolicy::default().unsupervised_settings().is_empty());
+    }
+
+    /// #87: caliban takes `CALIBAN_PARALLEL_TOOL_LIMIT` as a `NonZeroUsize`,
+    /// so 0 is a startup error in the agent. The schema is where that has to
+    /// be refused.
+    #[test]
+    fn crd_parallel_tool_limit_is_bounded_below_by_one() {
+        let crd = Workspace::crd();
+        let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
+        let limit = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"]["agentPolicy"]
+            ["properties"]["parallelToolLimit"];
+        // schemars renders the bound as a JSON number (`1.0`), so compare
+        // numerically rather than against an integer literal.
+        assert_eq!(limit["minimum"].as_f64(), Some(1.0), "{limit}");
+    }
+
+    /// The extension switches are optional, so an unset one leaves caliban's
+    /// own default alone rather than asserting a value.
+    #[test]
+    fn crd_extension_switches_are_optional_booleans() {
+        let crd = Workspace::crd();
+        let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
+        let policy = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"]["agentPolicy"]
+            ["properties"];
+        for f in [
+            "noMcp",
+            "noHooks",
+            "noSkills",
+            "noSubAgent",
+            "strictKnownMarketplaces",
+        ] {
+            assert_eq!(policy[f]["type"], "boolean", "{f}: {}", policy[f]);
+            assert_eq!(policy[f]["nullable"], true, "{f}: {}", policy[f]);
+        }
+    }
+
+    /// #87's fields reduce what an agent may reach; they do not hand it
+    /// unsupervised power. So, unlike #51's permission settings, they need no
+    /// `allowUnattended` authorization — asserted so the asymmetry is
+    /// deliberate rather than an omission someone later "fixes".
+    #[test]
+    fn the_extension_switches_need_no_unattended_authorization() {
+        let locked_down = AgentPolicy {
+            no_mcp: Some(true),
+            no_hooks: Some(true),
+            no_skills: Some(true),
+            no_sub_agent: Some(true),
+            strict_known_marketplaces: Some(true),
+            enabled_plugins: Some(vec![]),
+            blocked_marketplaces: Some(vec!["sketchy".into()]),
+            parallel_tool_limit: Some(1),
+            ..AgentPolicy::default()
+        };
+        assert!(locked_down.unsupervised_settings().is_empty());
     }
 
     /// The policy is pinned with the rest of the workspace (ADR 0004), so a

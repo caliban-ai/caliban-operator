@@ -35,3 +35,20 @@ spec:
   #   permissionMode: bypassPermissions
   #   autoAllow: true
   #   noPermissions: false
+  #
+  # The extension settings (#87) narrow what an agent can reach. They reduce
+  # surface rather than granting power, so they need no allowUnattended.
+  # agentPolicy:
+  #   noMcp: true                    # no MCP server discovery
+  #   noHooks: true                  # no external hook handlers
+  #   noSkills: true                 # no skill discovery
+  #   noSubAgent: true               # agents cannot spawn sub-agents
+  #   strictKnownMarketplaces: true  # refuse unrecognized marketplaces
+  #   blockedMarketplaces: [sketchy]
+  #   parallelToolLimit: 4           # at least 1; caliban refuses 0
+  #
+  # enabledPlugins is an allow-list: everything else is disabled. An empty
+  # list enables none, which is NOT the same as omitting the field — omitted
+  # enables every plugin caliban discovers.
+  #   enabledPlugins: [review, deploy]
+  #   enabledPlugins: []             # enable no plugins at all
