@@ -20,3 +20,18 @@ spec:
   # Optional agent policy (#80, ADR 0006). allowUnattended admits tasks with
   # permissionPosture: unattended; whoever can edit this Workspace controls it.
   # agentPolicy: { allowUnattended: true }
+  #
+  # The typed permission settings (#51) replace spelling these as raw `env`
+  # entries, and win over an `env` entry of the same name. Each is optional:
+  # an unset field leaves caliban's own default alone.
+  # agentPolicy:
+  #   permissionMode: acceptEdits   # default|acceptEdits|plan|auto|dontAsk|bypassPermissions
+  #
+  # dontAsk, bypassPermissions, autoAllow and noPermissions leave no human
+  # answering prompts, so they need allowUnattended as well (ADR 0006,
+  # decision 7) — without it the task is denied before it starts.
+  # agentPolicy:
+  #   allowUnattended: true
+  #   permissionMode: bypassPermissions
+  #   autoAllow: true
+  #   noPermissions: false

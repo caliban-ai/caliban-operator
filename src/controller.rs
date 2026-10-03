@@ -258,6 +258,33 @@ pub(crate) fn posture_problem(
     })
 }
 
+/// Why a workspace's own `agentPolicy` is not admissible (#51).
+///
+/// `permissionMode: dontAsk`/`bypassPermissions`, `autoAllow` and
+/// `noPermissions` hand agents the same unsupervised power that ADR 0006 put
+/// behind `allowUnattended`, so they cannot be granted by the back door of the
+/// permission mode: one switch authorizes unsupervised agents, and it is the
+/// one an auditor reads. Fail-closed, and the message names what was set.
+///
+/// Nothing re-checks this after pinning: the policy travels inside the pin
+/// (ADR 0004), so unlike a task's own posture it cannot change underneath a
+/// running task.
+pub(crate) fn policy_problem(rw: &crate::workspace::ResolvedWorkspace) -> Option<String> {
+    let asked = rw
+        .agent_policy
+        .as_ref()
+        .map(crate::workspace::AgentPolicy::unsupervised_settings)
+        .unwrap_or_default();
+    (!asked.is_empty() && !rw.allows_unattended()).then(|| {
+        format!(
+            "agentPolicy {} runs agents with no human answering permission \
+             prompts, which is not permitted: the workspace's \
+             agentPolicy.allowUnattended is not true",
+            asked.join(" and ")
+        )
+    })
+}
+
 /// Decide whether a `CalibanTask` may pin its `workspaceRef`/`providerRef`.
 /// Gates on the referenced `Workspace`'s readiness so a task never launches a
 /// doomed pod against a `Failed` workspace (e.g. a missing credential Secret)
@@ -286,7 +313,7 @@ pub(crate) fn admit(
         crate::workspace::WorkspacePhase::Ready => match resolve_workspace(&w.spec, provider_ref) {
             // Checked before pinning, so a denied task isn't pinned to the
             // policy that denied it: allowing it on the Workspace recovers it.
-            Ok(rw) => match posture_problem(posture, &rw) {
+            Ok(rw) => match posture_problem(posture, &rw).or_else(|| policy_problem(&rw)) {
                 Some(reason) => Admission::Deny(reason),
                 None => Admission::Pin(Box::new(rw)),
             },
@@ -621,8 +648,87 @@ mod tests {
         let mut ws = workspace(WorkspacePhase::Ready, None);
         ws.spec.agent_policy = Some(AgentPolicy {
             allow_unattended: allow,
+            ..AgentPolicy::default()
         });
         ws
+    }
+
+    /// A workspace whose policy hands agents unsupervised power.
+    fn workspace_with_policy(p: AgentPolicy) -> Workspace {
+        let mut ws = workspace(WorkspacePhase::Ready, None);
+        ws.spec.agent_policy = Some(p);
+        ws
+    }
+
+    /// #51: `bypassPermissions` is the same unsupervised power that ADR 0006
+    /// put behind `allowUnattended`, so it cannot be granted by the back door
+    /// of the permission mode. Fail-closed, and the message names the setting.
+    #[test]
+    fn admit_denies_an_unsupervised_permission_mode_without_allow_unattended() {
+        let ws = workspace_with_policy(AgentPolicy {
+            permission_mode: Some(crate::workspace::PermissionMode::BypassPermissions),
+            ..AgentPolicy::default()
+        });
+        match admit(Some(&ws), None, "team-a-ws", PermissionPosture::Supervised) {
+            Admission::Deny(msg) => {
+                assert!(msg.contains("bypassPermissions"), "{msg}");
+                assert!(msg.contains("allowUnattended"), "{msg}");
+            }
+            _ => panic!("expected Deny"),
+        }
+    }
+
+    /// The same gate covers the two switches that bypass prompting outright.
+    #[test]
+    fn admit_denies_auto_allow_and_no_permissions_without_allow_unattended() {
+        for p in [
+            AgentPolicy {
+                auto_allow: Some(true),
+                ..AgentPolicy::default()
+            },
+            AgentPolicy {
+                no_permissions: Some(true),
+                ..AgentPolicy::default()
+            },
+        ] {
+            let ws = workspace_with_policy(p);
+            assert!(matches!(
+                admit(Some(&ws), None, "team-a-ws", PermissionPosture::Supervised),
+                Admission::Deny(_)
+            ));
+        }
+    }
+
+    /// With the switch on, the same policy is admitted — one auditable place
+    /// authorizes unsupervised agents.
+    #[test]
+    fn admit_pins_an_unsupervised_policy_once_allow_unattended_authorizes_it() {
+        let ws = workspace_with_policy(AgentPolicy {
+            allow_unattended: true,
+            permission_mode: Some(crate::workspace::PermissionMode::DontAsk),
+            auto_allow: Some(true),
+            ..AgentPolicy::default()
+        });
+        assert!(matches!(
+            admit(Some(&ws), None, "team-a-ws", PermissionPosture::Supervised),
+            Admission::Pin(_)
+        ));
+    }
+
+    /// A supervised policy needs no authorization: the typed fields must not
+    /// become a reason to set `allowUnattended` on every workspace.
+    #[test]
+    fn admit_pins_a_supervised_policy_without_allow_unattended() {
+        let ws = workspace_with_policy(AgentPolicy {
+            permission_mode: Some(crate::workspace::PermissionMode::Plan),
+            auto_allow: Some(false),
+            no_permissions: Some(false),
+            ..AgentPolicy::default()
+        });
+        assert!(matches!(
+            admit(Some(&ws), None, "team-a-ws", PermissionPosture::Supervised),
+            Admission::Pin(_)
+        ));
     }
 
     #[test]
