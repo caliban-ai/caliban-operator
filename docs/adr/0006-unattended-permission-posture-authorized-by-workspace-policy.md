@@ -2,7 +2,8 @@
 
 - **Status:** accepted
 - **Date:** 2026-09-18
-- **Source:** caliban-operator [#80](https://github.com/caliban-ai/caliban-operator/issues/80) ·
+- **Source:** caliban-operator [#80](https://github.com/caliban-ai/caliban-operator/issues/80),
+  amended by [#51](https://github.com/caliban-ai/caliban-operator/issues/51) (decision 7) ·
   caliban ADR 0059 (per-session permission posture), caliban
   [#676](https://github.com/caliban-ai/caliban/issues/676) (`SpawnSpec.permission_posture`) ·
   prospero ADR 0010 (inbound API scopes) · builds on [ADR 0004](0004-workspace-crd-and-resolve-and-pin.md)
@@ -35,6 +36,7 @@ We will adopt option 2, and leave option 3 as a possible addition later.
 4. The policy is pinned into `status.resolvedWorkspace` with the rest of the Workspace config, as with every other part of the Workspace (ADR 0004). A pinned task is checked against its pin on every reconcile. Revoking `allowUnattended` does not disturb a task that is already running. Editing a running task's spec to `unattended` fails it if the pin doesn't allow that.
 5. The posture is visible. `status.permissionPosture` records the posture a task was admitted with, and appears as a printer column. A Normal `UnattendedAdmitted` Event names the Workspace whose policy allowed it.
 6. The operator does not hand the posture to caliband. prospero maps it onto `SpawnSpec.permission_posture` (ADR 0005).
+7. **`allowUnattended` authorizes the Workspace's own unsupervised settings too** (amended for [#51](https://github.com/caliban-ai/caliban-operator/issues/51)). #51 makes caliban's permission surface typed on the same `agentPolicy` block: `permissionMode`, `autoAllow`, `noPermissions`. Three of those settings — `permissionMode: dontAsk`, `permissionMode: bypassPermissions`, and either switch set to `true` — leave no human answering prompts, which is the power decision 2 gates. A Workspace asking for one of them is admitted only when it also sets `allowUnattended: true`; otherwise the task is denied before pinning, exactly as in decision 3, with the reason naming the setting. Without this, the same power would have two doors: one gated, one not. Unlike a task's posture, the policy cannot change under a running task — it travels inside the pin — so it is checked at admission only.
 
 ## Consequences
 
@@ -43,6 +45,7 @@ We will adopt option 2, and leave option 3 as a possible addition later.
 - A task can't run unattended unless a Workspace author allowed it, however the task was created. prospero's `admin` scope and this gate cover the two ways in.
 - Unattended tasks show up in `kubectl get calibantasks` (the `Posture` column) and in Events.
 - Uses the existing resolve-and-pin model; no new admission infrastructure.
+- One switch is the whole answer to "may agents here run unsupervised?", covering both a task's posture and the Workspace's own permission settings, so an auditor reads one field rather than four.
 
 **Negative**
 
