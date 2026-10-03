@@ -15,10 +15,14 @@ A two-stage build (`Dockerfile`):
   disk, so it runs fine under a **read-only root filesystem**.
 
 The image contains only the controller (`caliban-operator`), not the `crdgen`
-dev tool. Configuration is entirely via environment (`RUST_LOG`, `CALIBAND_IMAGE`,
-`CALIBAND_PORT`, `CALIBAN_AGENT_PORT_BASE`, `CALIBAN_AGENT_PORT_END`,
-`CALIBAN_WORKSPACE_ROOT`, `CALIBAN_WORKSPACE_STORAGE`, `CALIBAN_GIT_IMAGE`)
-— see the `caliban-operator` Helm chart.
+dev tool. `ENTRYPOINT` is the binary and it takes no arguments.
+
+Configuration is **entirely by environment** — there are no flags and no config
+file. See [Deploying and configuring](deploying.md#configuration) for the full
+set with defaults; the operator refuses to start on an invalid port window,
+selector or uid, naming the offending variable. The Helm chart in
+[caliban-ai/helm-charts](https://github.com/caliban-ai/helm-charts) wires a
+subset of them and leaves the rest on their compiled defaults.
 
 ## Build locally
 
@@ -38,8 +42,14 @@ per-arch** pipeline (no QEMU):
   then a `merge` job assembles the multi-arch manifest list and pushes the
   `{{version}}` and `sha-<sha>` tags via `docker buildx imagetools create`.
 
+Pin a version tag in a deployment rather than tracking a floating one, so an
+operator rollout is reproducible.
+
 Cut a release by tagging:
 
 ```sh
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.6.1 && git push origin v0.6.1
 ```
+
+Afterwards, bump `appVersion` in the `caliban-operator` Helm chart to match, and
+copy any changed `deploy/crd/*.yaml` into the `caliban-crds` chart.
