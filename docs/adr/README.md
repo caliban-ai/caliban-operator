@@ -2,9 +2,11 @@
 
 caliban-operator keeps its architecture decisions here, in MADR-lite format (see
 [ADR 0000](0000-architecture-decision-records.md)). Each record is an append-only
-`NNNN-kebab-title.md` with **Context**, **Decision**, **Consequences**. A decision
-is changed by writing a new ADR that supersedes the old one, never by rewriting
-history.
+`NNNN-kebab-title.md` with **Context**, **Decision**, **Consequences**, started
+from [`template.md`](template.md). A decision is changed by writing a new ADR
+that supersedes the old one, never by rewriting history; a supersession or
+amendment is annotated on **both** sides — the new record's header, the old
+record's header, and the old record's row below.
 
 | ADR | Title | Status |
 |-----|-------|--------|
