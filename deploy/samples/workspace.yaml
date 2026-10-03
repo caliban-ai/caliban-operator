@@ -17,6 +17,21 @@ spec:
       baseUrl: "http://192.168.1.240:9292/v1"
       model: qwen2.5-coder
   defaultProvider: planner
+  # Optional non-secret env for every agent pod in this workspace. Never put a
+  # credential here — use a provider credentialsRef, which reaches the pod as a
+  # secretKeyRef and never appears in the CR.
+  # env:
+  #   - { name: RUST_LOG, value: info }
+  # Optional egress restriction (#58, ADR 0002). Unset keeps allow-all egress.
+  # Set, agent pods may reach DNS plus only these destinations, and a task cannot
+  # widen it — so list the git remotes, the provider endpoints, and gonzalod if
+  # spec.state uses one. An empty allow list is DNS-only. The CIDRs below are
+  # RFC 5737 / RFC 3849 documentation ranges; substitute your own.
+  # egress:
+  #   allow:
+  #     - { cidr: 192.0.2.0/24, ports: [443] }      # provider API
+  #     - { cidr: 198.51.100.7/32, ports: [22] }    # git remote
+  #     - { cidr: 2001:db8::/32 }                   # every port to this range
   # Optional agent policy (#80, ADR 0006). allowUnattended admits tasks with
   # permissionPosture: unattended; whoever can edit this Workspace controls it.
   # agentPolicy: { allowUnattended: true }
