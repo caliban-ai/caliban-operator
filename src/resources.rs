@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
     ConfigMapVolumeSource, Container, ContainerPort, EnvVar, EnvVarSource,
-    PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
-    SecretKeySelector, SecretVolumeSource, ServiceAccount, TCPSocketAction, Volume, VolumeMount,
-    VolumeResourceRequirements,
+    PersistentVolumeClaimSpec, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
+    ResourceRequirements, SecretKeySelector, SecretVolumeSource, ServiceAccount, TCPSocketAction,
+    Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::api::networking::v1::{
     IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
@@ -279,6 +279,12 @@ fn sh_squote(v: &str) -> String {
 /// Build the idempotent clone script for the init container: for each workspace
 /// source, clone `repo` at `ref` into `path` unless it's already a git checkout
 /// (so pause/resume and pod restarts over the persistent PVC don't refetch).
+///
+/// That skip is also the one case #79 does not repair: a volume cloned before
+/// this fix still holds root-owned sources, and the init container — now
+/// non-root itself — cannot chown them back. `fsGroup` makes them writable,
+/// but git compares the owner uid, so it still refuses the checkout. Recreate
+/// the task (or delete its workspace PVC) to re-clone as the agent.
 fn clone_script(rw: &ResolvedWorkspace) -> String {
     let mut s = String::from("set -eu\n");
     for src in &rw.sources {
@@ -315,6 +321,31 @@ fn clone_init_container(rw: &ResolvedWorkspace, s: &Settings) -> Option<Containe
         resources: sandbox_resources(s),
         ..Default::default()
     })
+}
+
+/// Who the sandbox pod runs as (#79).
+///
+/// The clone init container used to carry no security context at all, so it ran
+/// as the git image's root while caliband runs as its image's `app` (uid 10001).
+/// Sources came out root-owned 755: git refused them outright ("detected
+/// dubious ownership") and the agent could not write into its own checkout.
+///
+/// The uid sits on the **pod**, not on each container, so the clone step and the
+/// agent cannot drift apart — there is nothing to keep in sync. `fsGroup` is
+/// what makes the non-root clone work on any volume rather than by luck:
+/// kubelet applies the group to the mounted workspace with `g+rwX`, so the
+/// clone does not depend on the mode the provisioner gave the volume root.
+/// `runAsNonRoot` makes a misconfigured uid 0 an admission failure instead of a
+/// silent return to root-owned sources, and matches what the operator's own
+/// Deployment already asks for itself.
+fn agent_security_context(s: &Settings) -> PodSecurityContext {
+    PodSecurityContext {
+        run_as_user: Some(s.agent_uid),
+        run_as_group: Some(s.agent_gid),
+        run_as_non_root: Some(true),
+        fs_group: Some(s.agent_gid),
+        ..Default::default()
+    }
 }
 
 /// CPU/memory requests and limits for both sandbox containers (#50). Without
@@ -526,6 +557,7 @@ pub fn build_sandbox(t: &CalibanTask, rw: &ResolvedWorkspace, s: &Settings) -> S
             .or_else(|| rw.isolation.as_ref().and_then(|i| i.runtime_class.clone())),
         service_account_name: Some(sa_name(t)),
         automount_service_account_token: Some(false),
+        security_context: Some(agent_security_context(s)),
         volumes: Some(volumes),
         ..Default::default()
     };
@@ -940,6 +972,63 @@ mod tests {
         let sb = build_sandbox(&t, &rw, &Settings::default());
         let pod = sb.spec.pod_template.spec.unwrap();
         assert!(pod.init_containers.is_none());
+    }
+
+    /// #79: the clone init container set no security context, so it ran as the
+    /// git image's root while caliband runs as the image's `app` (uid 10001).
+    /// Every cloned source came out root-owned 755: git refused it ("detected
+    /// dubious ownership") and the agent could not write into it either. The
+    /// uid lives on the pod, so the clone step and the agent cannot disagree.
+    #[test]
+    fn the_sandbox_pod_runs_every_container_as_the_agent_uid() {
+        let s = Settings::default();
+        let sb = build_sandbox(&task(), &resolved(), &s);
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let sc = pod.security_context.expect("pod security context");
+        assert_eq!(sc.run_as_user, Some(s.agent_uid));
+        assert_eq!(sc.run_as_group, Some(s.agent_gid));
+        assert_eq!(sc.run_as_non_root, Some(true));
+    }
+
+    /// `fsGroup` is what makes a non-root clone work on any volume rather than
+    /// by luck: kubelet applies the group and `g+rwX` to the mounted workspace,
+    /// so the clone does not depend on how the provisioner moded the volume
+    /// root.
+    #[test]
+    fn the_sandbox_pod_takes_group_ownership_of_the_workspace_volume() {
+        let s = Settings::default();
+        let sb = build_sandbox(&task(), &resolved(), &s);
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let sc = pod.security_context.expect("pod security context");
+        assert_eq!(sc.fs_group, Some(s.agent_gid));
+    }
+
+    /// The drift #79 was made of: no container may override the pod's user, or
+    /// the clone step and caliband can once again disagree about who owns the
+    /// workspace.
+    #[test]
+    fn no_sandbox_container_overrides_the_pods_user() {
+        for c in sandbox_containers(&Settings::default()) {
+            let user = c.security_context.as_ref().and_then(|sc| sc.run_as_user);
+            assert_eq!(user, None, "{} must not override the pod's user", c.name);
+        }
+    }
+
+    /// Clusters that pin a different uid range can move the agent; both the
+    /// clone step and the agent follow, because there is only one knob.
+    #[test]
+    fn a_configured_agent_uid_reaches_the_pod() {
+        let s = Settings {
+            agent_uid: 2000,
+            agent_gid: 2001,
+            ..Settings::default()
+        };
+        let sb = build_sandbox(&task(), &resolved(), &s);
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let sc = pod.security_context.expect("pod security context");
+        assert_eq!(sc.run_as_user, Some(2000));
+        assert_eq!(sc.run_as_group, Some(2001));
+        assert_eq!(sc.fs_group, Some(2001));
     }
 
     /// Both sandbox containers: caliband, then the git-clone init container.
