@@ -330,7 +330,7 @@ spec:
         assert_eq!(
             generated.trim(),
             committed.trim(),
-            "deploy/crd/calibantask.yaml is stale — regenerate: cargo run --bin crdgen > deploy/crd/calibantask.yaml"
+            "deploy/crd/calibantask.yaml is stale — regenerate: cargo run --bin crdgen calibantask > deploy/crd/calibantask.yaml"
         );
     }
 
