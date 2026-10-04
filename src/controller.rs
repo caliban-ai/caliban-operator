@@ -422,7 +422,12 @@ async fn reconcile(obj: Arc<CalibanTask>, ctx: Arc<Context>) -> Result<Action, E
                 posture,
             ) {
                 Admission::Pin(rw) => {
-                    let rw = *rw;
+                    // #52: the task's own model choice goes into the pin, over
+                    // the model the bound provider names. Applied here rather
+                    // than in `admit`, because which model to run is not an
+                    // admissibility question.
+                    let rw =
+                        (*rw).with_model(obj.spec.model.as_ref().and_then(|m| m.name.as_deref()));
                     // Persist the pin immediately so it's stable for the run.
                     // Any stale `WorkspaceUnresolved` condition left by a prior
                     // fail-fast reconcile is cleared once `derive_status` runs

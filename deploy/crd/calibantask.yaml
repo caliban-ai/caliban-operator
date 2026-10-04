@@ -61,6 +61,16 @@ spec:
                 description: Model-router configuration.
                 nullable: true
                 properties:
+                  name:
+                    description: |-
+                      Model this task's agents use, overriding the model the resolved
+                      Workspace provider names (#52). Lets a task pick a model without the
+                      Workspace binding a provider for it. The override is applied to the
+                      pinned resolution, so it cannot change under a running task, and the
+                      provider's endpoint and credential still apply.
+                    minLength: 1
+                    nullable: true
+                    type: string
                   routerConfigRef:
                     description: |-
                       Name of a ConfigMap (same namespace) holding the model router config
