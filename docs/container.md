@@ -7,7 +7,9 @@ The operator ships as a multi-arch container image at
 
 A two-stage build (`Dockerfile`):
 
-- **builder** — `rust:1.95-bookworm`, `cargo build --release --bin caliban-operator`
+- **builder** — `rust:1-bookworm`, `cargo build --release --bin caliban-operator`.
+  The exact toolchain comes from `rust-toolchain.toml`, which rustup reads from
+  the build context, so the version is written in one place only (#90).
   (rustls/ring + kube; no openssl/protoc/git2 native deps).
 - **runtime** — `debian:bookworm-slim` + `ca-certificates`, running the
   `caliban-operator` controller binary as a **non-root** user (uid `10001`,
