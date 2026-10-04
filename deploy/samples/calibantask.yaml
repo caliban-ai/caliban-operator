@@ -14,3 +14,12 @@ spec:
   # `unattended`, which needs the Workspace's agentPolicy.allowUnattended.
   # task: { prompt: "...", permissionPosture: unattended }
   # state: { gonzaloEndpoint: "http://gonzalod.storage.svc:8080", tokenRef: { secretName: gonzalo-agent-token, key: token } }
+  # Optional per-task model (#52), overriding the model the resolved Workspace
+  # provider names — so a task can pick a model without the Workspace binding
+  # a provider for it. The provider's endpoint and credential still apply, and
+  # the override is pinned at admission, so editing it later does not disturb a
+  # running task.
+  # model: { name: claude-opus-4-8 }
+  # routerConfigRef names a ConfigMap holding caliban.toml for the model router
+  # (#44); it is independent of `name` and may be set alongside it.
+  # model: { name: claude-opus-4-8, routerConfigRef: caliban-router }

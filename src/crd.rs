@@ -106,6 +106,14 @@ impl TaskSpec {
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelSpec {
+    /// Model this task's agents use, overriding the model the resolved
+    /// Workspace provider names (#52). Lets a task pick a model without the
+    /// Workspace binding a provider for it. The override is applied to the
+    /// pinned resolution, so it cannot change under a running task, and the
+    /// provider's endpoint and credential still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub name: Option<String>,
     /// Name of a ConfigMap (same namespace) holding the model router config
     /// under the key `caliban.toml`. Mounted read-only into the sandbox and
     /// handed to caliban as `CALIBAN_ROUTER_CONFIG`.
@@ -410,6 +418,25 @@ spec:
         // camelCase key survives re-serialization (prospero reads it back).
         let json = serde_json::to_value(&task.spec).unwrap();
         assert_eq!(json["task"]["interactive"], serde_json::json!(true));
+    }
+
+    /// #52: a task may name its own model without the workspace binding a
+    /// whole new provider for it. Optional, and non-empty when given — a blank
+    /// model is a misconfiguration, not a selection.
+    #[test]
+    fn crd_model_name_is_an_optional_non_empty_string() {
+        let crd = CalibanTask::crd();
+        let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
+        let model = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"]["model"];
+        let name = &model["properties"]["name"];
+        assert_eq!(name["type"], "string", "{model}");
+        assert_eq!(name["minLength"].as_f64(), Some(1.0), "{model}");
+        assert!(
+            model["required"]
+                .as_array()
+                .is_none_or(|r| !r.iter().any(|v| v == "name")),
+            "name must stay optional: {model}"
+        );
     }
 
     #[test]

@@ -463,6 +463,27 @@ pub struct ResolvedWorkspace {
 }
 
 impl ResolvedWorkspace {
+    /// Apply a task's `spec.model.name` over the bound provider's model (#52).
+    ///
+    /// The model was a property of the Workspace provider, so a task that
+    /// wanted a different one needed a whole new provider bound for it. The
+    /// task's choice is written into the pin rather than carried separately,
+    /// which is also why prospero needs no change: it already builds
+    /// `SpawnSpec.model` from the pinned provider.
+    ///
+    /// Only the model moves — the endpoint and credential the workspace bound
+    /// still apply, and a blank name is a misconfiguration rather than a
+    /// selection, so it leaves the provider's model alone instead of clearing
+    /// it. Being part of the pin, it also follows ADR 0004: editing the task
+    /// later cannot change what a running task was admitted with.
+    #[must_use]
+    pub fn with_model(mut self, name: Option<&str>) -> Self {
+        if let Some(m) = name.map(str::trim).filter(|m| !m.is_empty()) {
+            self.provider.model = Some(m.to_string());
+        }
+        self
+    }
+
     /// Whether the pinned policy admits an `unattended` task. A pin without a
     /// policy (including one made before the field existed) does not.
     pub fn allows_unattended(&self) -> bool {
@@ -573,6 +594,75 @@ mod tests {
                 ports: ports.to_vec(),
             }],
         }
+    }
+
+    /// A workspace whose bound provider names a model.
+    fn spec_with_model(model: &str) -> WorkspaceSpec {
+        let mut p = provider("workers", None);
+        p.base_url = Some("http://router:9292/v1".into());
+        p.model = Some(model.into());
+        spec_with(vec![p], None)
+    }
+
+    /// #52: the model was a property of the provider, so a task wanting a
+    /// different one needed a whole new provider. The task's choice is applied
+    /// to the pin — which is also why prospero needs no change: it already
+    /// builds `SpawnSpec.model` from the pinned provider.
+    #[test]
+    fn a_task_model_override_wins_over_the_providers_default() {
+        let rw = resolve_workspace(&spec_with_model("qwen2.5-coder"), None)
+            .unwrap()
+            .with_model(Some("claude-opus-4-8"));
+        assert_eq!(rw.provider.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    /// Absent override → the provider's default stands.
+    #[test]
+    fn without_an_override_the_pin_keeps_the_providers_model() {
+        let rw = resolve_workspace(&spec_with_model("qwen2.5-coder"), None)
+            .unwrap()
+            .with_model(None);
+        assert_eq!(rw.provider.model.as_deref(), Some("qwen2.5-coder"));
+    }
+
+    /// A blank value is not a choice — it must not erase the provider's model
+    /// and leave the agent with no model at all.
+    #[test]
+    fn a_blank_model_override_leaves_the_providers_model_alone() {
+        for blank in ["", "   "] {
+            let rw = resolve_workspace(&spec_with_model("qwen2.5-coder"), None)
+                .unwrap()
+                .with_model(Some(blank));
+            assert_eq!(
+                rw.provider.model.as_deref(),
+                Some("qwen2.5-coder"),
+                "{blank:?}"
+            );
+        }
+    }
+
+    /// The override picks a model, not a provider: the endpoint and credential
+    /// the workspace bound must survive it.
+    #[test]
+    fn a_model_override_changes_only_the_model() {
+        let mut spec = spec_with_model("qwen2.5-coder");
+        spec.providers[0].credentials_ref = Some(CredentialsRef {
+            secret_name: "anthropic-key".into(),
+            key: "api-key".into(),
+        });
+        let rw = resolve_workspace(&spec, None)
+            .unwrap()
+            .with_model(Some("claude-opus-4-8"));
+        assert_eq!(rw.provider.name, "workers");
+        assert_eq!(rw.provider.kind, "anthropic");
+        assert_eq!(
+            rw.provider.base_url.as_deref(),
+            Some("http://router:9292/v1")
+        );
+        assert_eq!(
+            rw.provider.credentials_ref.as_ref().unwrap().secret_name,
+            "anthropic-key"
+        );
     }
 
     /// #58: the allow-list is workspace-wide and pinned at admission, like the

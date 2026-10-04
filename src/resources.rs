@@ -1249,6 +1249,7 @@ mod tests {
         use crate::crd::ModelSpec;
         let mut t = task();
         t.spec.model = Some(ModelSpec {
+            name: None,
             router_config_ref: Some("caliban-router".into()),
         });
         let sb = build_sandbox(&t, &resolved(), &Settings::default());
