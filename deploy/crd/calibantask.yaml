@@ -109,6 +109,9 @@ spec:
                     description: |-
                       `remote` (shared gonzalod) or `local` (in-pod filesystem). Defaults to
                       `remote` when `gonzaloEndpoint` is set.
+                    enum:
+                    - remote
+                    - local
                     nullable: true
                     type: string
                   tokenRef:
