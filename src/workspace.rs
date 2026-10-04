@@ -87,8 +87,10 @@ pub struct WorkspaceSpec {
     pub agent_policy: Option<AgentPolicy>,
 }
 
-// #80 adds the first field; #51 extends this block with the typed caliban
-// governance settings. (`//` so this stays out of the CRD.)
+// #80 adds `allowUnattended`; #51 adds the typed permission settings, which
+// replace spelling them as raw `env` entries. The extension switches
+// (`noMcp`, `noHooks`, `enabledPlugins`, ...) land next. (`//` so this stays
+// out of the CRD.)
 /// Workspace-wide policy for the agents a task launches.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -96,9 +98,115 @@ pub struct AgentPolicy {
     /// Admit tasks whose `permissionPosture` is `unattended`, which run under
     /// a bypass profile with no human answering permission prompts. Defaults
     /// to false. Whoever can edit this Workspace controls it, so limit who has
-    /// write access to Workspaces.
+    /// write access to Workspaces. Also authorizes the unsupervised settings
+    /// below.
     #[serde(default)]
     pub allow_unattended: bool,
+    /// Initial permission mode for every agent in this workspace. Unset leaves
+    /// caliban's own default, and a `--permission-mode` flag still wins over
+    /// it. `dontAsk` and `bypassPermissions` answer prompts without a human,
+    /// so they are only admitted when `allowUnattended` is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<PermissionMode>,
+    /// Allow tools that would otherwise prompt, without asking. Dangerous, and
+    /// only admitted when `allowUnattended` is true. Unset projects nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_allow: Option<bool>,
+    /// Disable permission gating altogether, allowing every tool call. The
+    /// bluntest of these levers, and only admitted when `allowUnattended` is
+    /// true. Unset projects nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_permissions: Option<bool>,
+    /// Disable MCP server discovery. Unset leaves caliban's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_mcp: Option<bool>,
+    /// Bypass every external hook handler. caliban's in-process hooks still
+    /// run. Unset leaves caliban's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_hooks: Option<bool>,
+    /// Disable skill discovery at startup. Unset leaves caliban's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_skills: Option<bool>,
+    /// Disable the built-in agent tool, so an agent cannot spawn sub-agents.
+    /// Unset leaves caliban's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_sub_agent: Option<bool>,
+    /// Block plugin installs from marketplaces caliban doesn't recognise.
+    /// Unset leaves caliban's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_known_marketplaces: Option<bool>,
+    /// Plugin names to enable; every other discovered plugin is disabled. An
+    /// empty list enables none of them, which is different from leaving the
+    /// field unset — unset enables everything discovered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_plugins: Option<Vec<String>>,
+    /// Marketplace names to block. Unset blocks none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_marketplaces: Option<Vec<String>>,
+    /// Maximum concurrent tool invocations per turn. At least 1 — caliban
+    /// reads this as a non-zero integer and refuses 0 at startup. Unset leaves
+    /// caliban's default of one less than the CPU count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub parallel_tool_limit: Option<u32>,
+}
+
+// caliban's permission modes, as `CALIBAN_DEFAULT_PERMISSION_MODE` accepts
+// them (caliban's `PermissionMode`; see its docs/guide env-vars reference).
+// `//`, not `///`: an enum's doc replaces the referencing field's description
+// in the generated CRD.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionMode {
+    Default,
+    AcceptEdits,
+    Plan,
+    Auto,
+    DontAsk,
+    BypassPermissions,
+}
+
+impl PermissionMode {
+    /// Whether this mode resolves a permission prompt with no human in the
+    /// loop. `dontAsk` turns every `Ask` into `Allow` by caliban's own
+    /// definition, so it grants the same power as `bypassPermissions`; `auto`
+    /// still classifies each call, so it does not.
+    pub fn is_unsupervised(self) -> bool {
+        matches!(self, Self::DontAsk | Self::BypassPermissions)
+    }
+
+    /// The value `CALIBAN_DEFAULT_PERMISSION_MODE` takes for this mode.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "acceptEdits",
+            Self::Plan => "plan",
+            Self::Auto => "auto",
+            Self::DontAsk => "dontAsk",
+            Self::BypassPermissions => "bypassPermissions",
+        }
+    }
+}
+
+impl AgentPolicy {
+    /// The settings in this policy that hand agents unsupervised power, named
+    /// as they appear in the CRD so a denial can quote them. Empty when the
+    /// policy only asks for supervised behaviour — `false` is not a request.
+    pub fn unsupervised_settings(&self) -> Vec<String> {
+        let mut found = Vec::new();
+        if let Some(m) = self.permission_mode {
+            if m.is_unsupervised() {
+                found.push(format!("permissionMode '{}'", m.wire_name()));
+            }
+        }
+        if self.auto_allow == Some(true) {
+            found.push("autoAllow".to_string());
+        }
+        if self.no_permissions == Some(true) {
+            found.push("noPermissions".to_string());
+        }
+        found
+    }
 }
 
 /// Workspace-wide egress restriction for agent pods.
@@ -355,6 +463,27 @@ pub struct ResolvedWorkspace {
 }
 
 impl ResolvedWorkspace {
+    /// Apply a task's `spec.model.name` over the bound provider's model (#52).
+    ///
+    /// The model was a property of the Workspace provider, so a task that
+    /// wanted a different one needed a whole new provider bound for it. The
+    /// task's choice is written into the pin rather than carried separately,
+    /// which is also why prospero needs no change: it already builds
+    /// `SpawnSpec.model` from the pinned provider.
+    ///
+    /// Only the model moves — the endpoint and credential the workspace bound
+    /// still apply, and a blank name is a misconfiguration rather than a
+    /// selection, so it leaves the provider's model alone instead of clearing
+    /// it. Being part of the pin, it also follows ADR 0004: editing the task
+    /// later cannot change what a running task was admitted with.
+    #[must_use]
+    pub fn with_model(mut self, name: Option<&str>) -> Self {
+        if let Some(m) = name.map(str::trim).filter(|m| !m.is_empty()) {
+            self.provider.model = Some(m.to_string());
+        }
+        self
+    }
+
     /// Whether the pinned policy admits an `unattended` task. A pin without a
     /// policy (including one made before the field existed) does not.
     pub fn allows_unattended(&self) -> bool {
@@ -465,6 +594,75 @@ mod tests {
                 ports: ports.to_vec(),
             }],
         }
+    }
+
+    /// A workspace whose bound provider names a model.
+    fn spec_with_model(model: &str) -> WorkspaceSpec {
+        let mut p = provider("workers", None);
+        p.base_url = Some("http://router:9292/v1".into());
+        p.model = Some(model.into());
+        spec_with(vec![p], None)
+    }
+
+    /// #52: the model was a property of the provider, so a task wanting a
+    /// different one needed a whole new provider. The task's choice is applied
+    /// to the pin — which is also why prospero needs no change: it already
+    /// builds `SpawnSpec.model` from the pinned provider.
+    #[test]
+    fn a_task_model_override_wins_over_the_providers_default() {
+        let rw = resolve_workspace(&spec_with_model("qwen2.5-coder"), None)
+            .unwrap()
+            .with_model(Some("claude-opus-4-8"));
+        assert_eq!(rw.provider.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    /// Absent override → the provider's default stands.
+    #[test]
+    fn without_an_override_the_pin_keeps_the_providers_model() {
+        let rw = resolve_workspace(&spec_with_model("qwen2.5-coder"), None)
+            .unwrap()
+            .with_model(None);
+        assert_eq!(rw.provider.model.as_deref(), Some("qwen2.5-coder"));
+    }
+
+    /// A blank value is not a choice — it must not erase the provider's model
+    /// and leave the agent with no model at all.
+    #[test]
+    fn a_blank_model_override_leaves_the_providers_model_alone() {
+        for blank in ["", "   "] {
+            let rw = resolve_workspace(&spec_with_model("qwen2.5-coder"), None)
+                .unwrap()
+                .with_model(Some(blank));
+            assert_eq!(
+                rw.provider.model.as_deref(),
+                Some("qwen2.5-coder"),
+                "{blank:?}"
+            );
+        }
+    }
+
+    /// The override picks a model, not a provider: the endpoint and credential
+    /// the workspace bound must survive it.
+    #[test]
+    fn a_model_override_changes_only_the_model() {
+        let mut spec = spec_with_model("qwen2.5-coder");
+        spec.providers[0].credentials_ref = Some(CredentialsRef {
+            secret_name: "anthropic-key".into(),
+            key: "api-key".into(),
+        });
+        let rw = resolve_workspace(&spec, None)
+            .unwrap()
+            .with_model(Some("claude-opus-4-8"));
+        assert_eq!(rw.provider.name, "workers");
+        assert_eq!(rw.provider.kind, "anthropic");
+        assert_eq!(
+            rw.provider.base_url.as_deref(),
+            Some("http://router:9292/v1")
+        );
+        assert_eq!(
+            rw.provider.credentials_ref.as_ref().unwrap().secret_name,
+            "anthropic-key"
+        );
     }
 
     /// #58: the allow-list is workspace-wide and pinned at admission, like the
@@ -715,6 +913,158 @@ mod tests {
         assert_eq!(spec.agent_policy, Some(AgentPolicy::default()));
         let rw = resolve_workspace(&spec, None).unwrap();
         assert!(!rw.allows_unattended());
+    }
+
+    /// #51: the enum must carry exactly caliban's modes. A value caliban
+    /// doesn't know is a startup error in the agent, so the schema is where it
+    /// has to be caught.
+    #[test]
+    fn crd_permission_mode_restricts_to_calibans_six_modes() {
+        let crd = Workspace::crd();
+        let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
+        let mode = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"]["agentPolicy"]
+            ["properties"]["permissionMode"];
+        // An optional enum also admits `null` (schemars pairs it with
+        // `nullable`), which is how "unset" is spelled — so compare the named
+        // modes and assert the nullability separately.
+        assert_eq!(mode["nullable"], true, "{mode}");
+        let mut got: Vec<String> = mode["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("permissionMode is an enum: {mode}"))
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        got.sort();
+        let mut want = vec![
+            "acceptEdits",
+            "auto",
+            "bypassPermissions",
+            "default",
+            "dontAsk",
+            "plan",
+        ];
+        want.sort_unstable();
+        assert_eq!(got, want, "{mode}");
+    }
+
+    /// Which modes resolve a permission prompt with no human in the loop.
+    /// `dontAsk` turns every `Ask` into `Allow` by caliban's own definition, so
+    /// it is as unsupervised as `bypassPermissions`; `auto` still classifies
+    /// each call, so it is not.
+    #[test]
+    fn the_modes_that_answer_prompts_without_a_human_are_unsupervised() {
+        for m in [PermissionMode::DontAsk, PermissionMode::BypassPermissions] {
+            assert!(m.is_unsupervised(), "{m:?}");
+        }
+        for m in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Plan,
+            PermissionMode::Auto,
+        ] {
+            assert!(!m.is_unsupervised(), "{m:?}");
+        }
+    }
+
+    /// The denial message has to name what the user actually set, so every
+    /// unsupervised setting reports itself.
+    #[test]
+    fn a_policy_names_each_unsupervised_setting_it_asks_for() {
+        let p = AgentPolicy {
+            permission_mode: Some(PermissionMode::BypassPermissions),
+            auto_allow: Some(true),
+            no_permissions: Some(true),
+            ..AgentPolicy::default()
+        };
+        let got = p.unsupervised_settings();
+        assert!(
+            got.iter().any(|s| s.contains("bypassPermissions")),
+            "{got:?}"
+        );
+        assert!(got.iter().any(|s| s.contains("autoAllow")), "{got:?}");
+        assert!(got.iter().any(|s| s.contains("noPermissions")), "{got:?}");
+
+        // A supervised policy asks for nothing that needs authorizing — and
+        // `false` is not a request.
+        let supervised = AgentPolicy {
+            permission_mode: Some(PermissionMode::AcceptEdits),
+            auto_allow: Some(false),
+            no_permissions: Some(false),
+            ..AgentPolicy::default()
+        };
+        assert!(supervised.unsupervised_settings().is_empty());
+        assert!(AgentPolicy::default().unsupervised_settings().is_empty());
+    }
+
+    /// #87: caliban takes `CALIBAN_PARALLEL_TOOL_LIMIT` as a `NonZeroUsize`,
+    /// so 0 is a startup error in the agent. The schema is where that has to
+    /// be refused.
+    #[test]
+    fn crd_parallel_tool_limit_is_bounded_below_by_one() {
+        let crd = Workspace::crd();
+        let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
+        let limit = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"]["agentPolicy"]
+            ["properties"]["parallelToolLimit"];
+        // schemars renders the bound as a JSON number (`1.0`), so compare
+        // numerically rather than against an integer literal.
+        assert_eq!(limit["minimum"].as_f64(), Some(1.0), "{limit}");
+    }
+
+    /// The extension switches are optional, so an unset one leaves caliban's
+    /// own default alone rather than asserting a value.
+    #[test]
+    fn crd_extension_switches_are_optional_booleans() {
+        let crd = Workspace::crd();
+        let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
+        let policy = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"]["agentPolicy"]
+            ["properties"];
+        for f in [
+            "noMcp",
+            "noHooks",
+            "noSkills",
+            "noSubAgent",
+            "strictKnownMarketplaces",
+        ] {
+            assert_eq!(policy[f]["type"], "boolean", "{f}: {}", policy[f]);
+            assert_eq!(policy[f]["nullable"], true, "{f}: {}", policy[f]);
+        }
+    }
+
+    /// #87's fields reduce what an agent may reach; they do not hand it
+    /// unsupervised power. So, unlike #51's permission settings, they need no
+    /// `allowUnattended` authorization — asserted so the asymmetry is
+    /// deliberate rather than an omission someone later "fixes".
+    #[test]
+    fn the_extension_switches_need_no_unattended_authorization() {
+        let locked_down = AgentPolicy {
+            no_mcp: Some(true),
+            no_hooks: Some(true),
+            no_skills: Some(true),
+            no_sub_agent: Some(true),
+            strict_known_marketplaces: Some(true),
+            enabled_plugins: Some(vec![]),
+            blocked_marketplaces: Some(vec!["sketchy".into()]),
+            parallel_tool_limit: Some(1),
+            ..AgentPolicy::default()
+        };
+        assert!(locked_down.unsupervised_settings().is_empty());
+    }
+
+    /// The policy is pinned with the rest of the workspace (ADR 0004), so a
+    /// later edit cannot change what a running task was admitted under.
+    #[test]
+    fn resolve_pins_the_typed_policy_fields() {
+        let spec: WorkspaceSpec = serde_json::from_value(serde_json::json!({
+            "displayName": "x",
+            "providers": [{ "name": "p", "kind": "openai" }],
+            "agentPolicy": { "permissionMode": "plan", "noPermissions": false }
+        }))
+        .unwrap();
+        let rw = resolve_workspace(&spec, None).unwrap();
+        let p = rw.agent_policy.expect("policy pinned");
+        assert_eq!(p.permission_mode, Some(PermissionMode::Plan));
+        assert_eq!(p.no_permissions, Some(false));
+        assert_eq!(p.auto_allow, None);
     }
 
     #[test]

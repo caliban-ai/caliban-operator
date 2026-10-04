@@ -61,6 +61,16 @@ spec:
                 description: Model-router configuration.
                 nullable: true
                 properties:
+                  name:
+                    description: |-
+                      Model this task's agents use, overriding the model the resolved
+                      Workspace provider names (#52). Lets a task pick a model without the
+                      Workspace binding a provider for it. The override is applied to the
+                      pinned resolution, so it cannot change under a running task, and the
+                      provider's endpoint and credential still apply.
+                    minLength: 1
+                    nullable: true
+                    type: string
                   routerConfigRef:
                     description: |-
                       Name of a ConfigMap (same namespace) holding the model router config
@@ -99,6 +109,9 @@ spec:
                     description: |-
                       `remote` (shared gonzalod) or `local` (in-pod filesystem). Defaults to
                       `remote` when `gonzaloEndpoint` is set.
+                    enum:
+                    - remote
+                    - local
                     nullable: true
                     type: string
                   tokenRef:
@@ -251,7 +264,87 @@ spec:
                           Admit tasks whose `permissionPosture` is `unattended`, which run under
                           a bypass profile with no human answering permission prompts. Defaults
                           to false. Whoever can edit this Workspace controls it, so limit who has
-                          write access to Workspaces.
+                          write access to Workspaces. Also authorizes the unsupervised settings
+                          below.
+                        type: boolean
+                      autoAllow:
+                        description: |-
+                          Allow tools that would otherwise prompt, without asking. Dangerous, and
+                          only admitted when `allowUnattended` is true. Unset projects nothing.
+                        nullable: true
+                        type: boolean
+                      blockedMarketplaces:
+                        description: Marketplace names to block. Unset blocks none.
+                        items:
+                          type: string
+                        nullable: true
+                        type: array
+                      enabledPlugins:
+                        description: |-
+                          Plugin names to enable; every other discovered plugin is disabled. An
+                          empty list enables none of them, which is different from leaving the
+                          field unset — unset enables everything discovered.
+                        items:
+                          type: string
+                        nullable: true
+                        type: array
+                      noHooks:
+                        description: |-
+                          Bypass every external hook handler. caliban's in-process hooks still
+                          run. Unset leaves caliban's default.
+                        nullable: true
+                        type: boolean
+                      noMcp:
+                        description: Disable MCP server discovery. Unset leaves caliban's default.
+                        nullable: true
+                        type: boolean
+                      noPermissions:
+                        description: |-
+                          Disable permission gating altogether, allowing every tool call. The
+                          bluntest of these levers, and only admitted when `allowUnattended` is
+                          true. Unset projects nothing.
+                        nullable: true
+                        type: boolean
+                      noSkills:
+                        description: Disable skill discovery at startup. Unset leaves caliban's default.
+                        nullable: true
+                        type: boolean
+                      noSubAgent:
+                        description: |-
+                          Disable the built-in agent tool, so an agent cannot spawn sub-agents.
+                          Unset leaves caliban's default.
+                        nullable: true
+                        type: boolean
+                      parallelToolLimit:
+                        description: |-
+                          Maximum concurrent tool invocations per turn. At least 1 — caliban
+                          reads this as a non-zero integer and refuses 0 at startup. Unset leaves
+                          caliban's default of one less than the CPU count.
+                        format: uint32
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                      permissionMode:
+                        description: |-
+                          Initial permission mode for every agent in this workspace. Unset leaves
+                          caliban's own default, and a `--permission-mode` flag still wins over
+                          it. `dontAsk` and `bypassPermissions` answer prompts without a human,
+                          so they are only admitted when `allowUnattended` is true.
+                        enum:
+                        - default
+                        - acceptEdits
+                        - plan
+                        - auto
+                        - dontAsk
+                        - bypassPermissions
+                        - null
+                        nullable: true
+                        type: string
+                      strictKnownMarketplaces:
+                        description: |-
+                          Block plugin installs from marketplaces caliban doesn't recognise.
+                          Unset leaves caliban's default.
+                        nullable: true
                         type: boolean
                     type: object
                   egress:

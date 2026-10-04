@@ -197,8 +197,76 @@ fn caliband_env(t: &CalibanTask, rw: &ResolvedWorkspace) -> Vec<EnvVar> {
         ));
     }
     e.extend(provider_env(&rw.provider));
+    let policy = agent_policy_env(rw);
+    let typed: Vec<String> = policy.iter().map(|v| v.name.clone()).collect();
+    e.extend(policy);
     for kv in &rw.env {
+        // #51: a validated field beats the untyped escape hatch. Raw `env` is
+        // how policy was expressed before the typed fields existed, so a stale
+        // entry there must not quietly re-open what the policy closed. Dropped
+        // rather than appended, so the result doesn't depend on how a runtime
+        // resolves a duplicate name.
+        if typed.iter().any(|n| n == &kv.name) {
+            continue;
+        }
         e.push(env(&kv.name, kv.value.clone()));
+    }
+    e
+}
+
+/// The typed `agentPolicy` (#51) projected onto the env caliban actually reads
+/// (its `docs/guide/src/reference/env-vars.md`).
+///
+/// Only a field the user set is projected. An unset one leaves caliban's own
+/// default in place — and its CLI flag, which beats the env — where projecting
+/// a guessed value would silently override both. Booleans render as `true` /
+/// `false`, the spellings caliban's flag parser takes; it rejects anything else
+/// at startup.
+fn agent_policy_env(rw: &ResolvedWorkspace) -> Vec<EnvVar> {
+    let Some(p) = rw.agent_policy.as_ref() else {
+        return Vec::new();
+    };
+    let mut e = Vec::new();
+    if let Some(m) = p.permission_mode {
+        e.push(env(
+            "CALIBAN_DEFAULT_PERMISSION_MODE",
+            m.wire_name().to_string(),
+        ));
+    }
+    for (name, set) in [
+        ("CALIBAN_AUTO_ALLOW", p.auto_allow),
+        ("CALIBAN_NO_PERMISSIONS", p.no_permissions),
+        // #87: the extension surface. These reduce what an agent can reach
+        // rather than granting it power, so they need no `allowUnattended`.
+        ("CALIBAN_NO_MCP", p.no_mcp),
+        ("CALIBAN_NO_HOOKS", p.no_hooks),
+        ("CALIBAN_NO_SKILLS", p.no_skills),
+        ("CALIBAN_NO_SUB_AGENT", p.no_sub_agent),
+        (
+            "CALIBAN_STRICT_KNOWN_MARKETPLACES",
+            p.strict_known_marketplaces,
+        ),
+    ] {
+        if let Some(b) = set {
+            e.push(env(name, b.to_string()));
+        }
+    }
+    // A present list projects even when empty: caliban reads an empty
+    // `CALIBAN_ENABLED_PLUGINS` as "enable none", where unset enables
+    // everything it discovers, so the two cannot be collapsed.
+    for (name, list) in [
+        ("CALIBAN_ENABLED_PLUGINS", p.enabled_plugins.as_ref()),
+        (
+            "CALIBAN_BLOCKED_MARKETPLACES",
+            p.blocked_marketplaces.as_ref(),
+        ),
+    ] {
+        if let Some(names) = list {
+            e.push(env(name, names.join(",")));
+        }
+    }
+    if let Some(n) = p.parallel_tool_limit {
+        e.push(env("CALIBAN_PARALLEL_TOOL_LIMIT", n.to_string()));
     }
     e
 }
@@ -1181,6 +1249,7 @@ mod tests {
         use crate::crd::ModelSpec;
         let mut t = task();
         t.spec.model = Some(ModelSpec {
+            name: None,
             router_config_ref: Some("caliban-router".into()),
         });
         let sb = build_sandbox(&t, &resolved(), &Settings::default());
@@ -1260,6 +1329,195 @@ mod tests {
         assert!(env
             .iter()
             .any(|e| e.name == "CALIBAN_PROVIDER" && e.value.as_deref() == Some("openai")));
+        assert!(env
+            .iter()
+            .any(|e| e.name == "FOO" && e.value.as_deref() == Some("bar")));
+    }
+
+    /// #51: the typed policy is projected onto the env names caliban actually
+    /// reads (`docs/guide/src/reference/env-vars.md`). Booleans render as the
+    /// flag parser's `true`/`false` — caliban treats any other spelling as a
+    /// startup error.
+    #[test]
+    fn agent_policy_projects_the_governance_env_caliban_reads() {
+        use crate::workspace::{AgentPolicy, PermissionMode};
+        let mut rw = resolved();
+        rw.agent_policy = Some(AgentPolicy {
+            permission_mode: Some(PermissionMode::AcceptEdits),
+            auto_allow: Some(false),
+            no_permissions: Some(true),
+            allow_unattended: true,
+            ..AgentPolicy::default()
+        });
+        let sb = build_sandbox(&task(), &rw, &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+        let get = |n: &str| {
+            env.iter()
+                .find(|e| e.name == n)
+                .unwrap_or_else(|| panic!("{n} projected: {env:?}"))
+                .value
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(get("CALIBAN_DEFAULT_PERMISSION_MODE"), "acceptEdits");
+        assert_eq!(get("CALIBAN_AUTO_ALLOW"), "false");
+        assert_eq!(get("CALIBAN_NO_PERMISSIONS"), "true");
+    }
+
+    /// #87: the extension surface, on the env names caliban reads. Lists join
+    /// with `,`; the limit is an integer caliban parses as `NonZeroUsize`.
+    #[test]
+    fn extension_policy_projects_the_env_caliban_reads() {
+        use crate::workspace::AgentPolicy;
+        let mut rw = resolved();
+        rw.agent_policy = Some(AgentPolicy {
+            no_mcp: Some(true),
+            no_hooks: Some(true),
+            no_skills: Some(false),
+            no_sub_agent: Some(true),
+            strict_known_marketplaces: Some(true),
+            enabled_plugins: Some(vec!["review".into(), "deploy".into()]),
+            blocked_marketplaces: Some(vec!["sketchy".into()]),
+            parallel_tool_limit: Some(4),
+            ..AgentPolicy::default()
+        });
+        let sb = build_sandbox(&task(), &rw, &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+        let get = |n: &str| {
+            env.iter()
+                .find(|e| e.name == n)
+                .unwrap_or_else(|| panic!("{n} projected: {env:?}"))
+                .value
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(get("CALIBAN_NO_MCP"), "true");
+        assert_eq!(get("CALIBAN_NO_HOOKS"), "true");
+        assert_eq!(get("CALIBAN_NO_SKILLS"), "false");
+        assert_eq!(get("CALIBAN_NO_SUB_AGENT"), "true");
+        assert_eq!(get("CALIBAN_STRICT_KNOWN_MARKETPLACES"), "true");
+        assert_eq!(get("CALIBAN_ENABLED_PLUGINS"), "review,deploy");
+        assert_eq!(get("CALIBAN_BLOCKED_MARKETPLACES"), "sketchy");
+        assert_eq!(get("CALIBAN_PARALLEL_TOOL_LIMIT"), "4");
+    }
+
+    /// An empty allow-list is not the same as no allow-list: caliban reads an
+    /// empty `CALIBAN_ENABLED_PLUGINS` as "enable nothing" (`Some(vec![])` in
+    /// its own parser), while unset enables everything discovered. The CRD has
+    /// to preserve that distinction, so an explicitly empty list still
+    /// projects.
+    #[test]
+    fn an_empty_enabled_plugins_list_projects_and_disables_every_plugin() {
+        use crate::workspace::AgentPolicy;
+        let mut rw = resolved();
+        rw.agent_policy = Some(AgentPolicy {
+            enabled_plugins: Some(vec![]),
+            ..AgentPolicy::default()
+        });
+        let sb = build_sandbox(&task(), &rw, &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+        let e = env
+            .iter()
+            .find(|e| e.name == "CALIBAN_ENABLED_PLUGINS")
+            .unwrap_or_else(|| panic!("projected even when empty: {env:?}"));
+        assert_eq!(e.value.as_deref(), Some(""));
+    }
+
+    /// The precedence rule covers the extension names too, not just #51's.
+    #[test]
+    fn a_typed_extension_field_wins_over_a_conflicting_workspace_env_entry() {
+        use crate::workspace::{AgentPolicy, EnvEntry};
+        let mut rw = resolved();
+        rw.agent_policy = Some(AgentPolicy {
+            no_mcp: Some(false),
+            ..AgentPolicy::default()
+        });
+        rw.env = vec![EnvEntry {
+            name: "CALIBAN_NO_MCP".into(),
+            value: "true".into(),
+        }];
+        let sb = build_sandbox(&task(), &rw, &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+        let vals: Vec<_> = env
+            .iter()
+            .filter(|e| e.name == "CALIBAN_NO_MCP")
+            .map(|e| e.value.clone().unwrap())
+            .collect();
+        assert_eq!(vals, vec!["false".to_string()]);
+    }
+
+    /// An unset field projects nothing, so caliban's own default — and a CLI
+    /// flag, which beats the env — still applies. Projecting a guessed value
+    /// would silently override both.
+    #[test]
+    fn an_unset_policy_field_projects_no_env_at_all() {
+        use crate::workspace::{AgentPolicy, PermissionMode};
+        let mut rw = resolved();
+        rw.agent_policy = Some(AgentPolicy {
+            permission_mode: Some(PermissionMode::Plan),
+            ..AgentPolicy::default()
+        });
+        let sb = build_sandbox(&task(), &rw, &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+        assert!(env
+            .iter()
+            .any(|e| e.name == "CALIBAN_DEFAULT_PERMISSION_MODE"));
+        for absent in [
+            "CALIBAN_AUTO_ALLOW",
+            "CALIBAN_NO_PERMISSIONS",
+            "CALIBAN_NO_MCP",
+            "CALIBAN_NO_HOOKS",
+            "CALIBAN_NO_SKILLS",
+            "CALIBAN_NO_SUB_AGENT",
+            "CALIBAN_STRICT_KNOWN_MARKETPLACES",
+            "CALIBAN_ENABLED_PLUGINS",
+            "CALIBAN_BLOCKED_MARKETPLACES",
+            "CALIBAN_PARALLEL_TOOL_LIMIT",
+        ] {
+            assert!(!env.iter().any(|e| e.name == absent), "{absent}: {env:?}");
+        }
+    }
+
+    /// A validated field must beat the untyped escape hatch, or the typed
+    /// surface is decorative: raw `env` is how policy was expressed before #51,
+    /// and a stale entry there must not quietly re-open what the policy closed.
+    #[test]
+    fn a_typed_policy_field_wins_over_a_conflicting_workspace_env_entry() {
+        use crate::workspace::{AgentPolicy, EnvEntry, PermissionMode};
+        let mut rw = resolved();
+        rw.agent_policy = Some(AgentPolicy {
+            permission_mode: Some(PermissionMode::Plan),
+            ..AgentPolicy::default()
+        });
+        rw.env = vec![
+            EnvEntry {
+                name: "CALIBAN_DEFAULT_PERMISSION_MODE".into(),
+                value: "bypassPermissions".into(),
+            },
+            EnvEntry {
+                name: "FOO".into(),
+                value: "bar".into(),
+            },
+        ];
+        let sb = build_sandbox(&task(), &rw, &Settings::default());
+        let pod = sb.spec.pod_template.spec.unwrap();
+        let env = pod.containers[0].env.clone().unwrap();
+        let modes: Vec<_> = env
+            .iter()
+            .filter(|e| e.name == "CALIBAN_DEFAULT_PERMISSION_MODE")
+            .map(|e| e.value.clone().unwrap())
+            .collect();
+        assert_eq!(
+            modes,
+            vec!["plan".to_string()],
+            "typed field wins exactly once"
+        );
+        // Unrelated passthrough is untouched.
         assert!(env
             .iter()
             .any(|e| e.name == "FOO" && e.value.as_deref() == Some("bar")));

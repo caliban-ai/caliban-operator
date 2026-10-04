@@ -63,6 +63,23 @@ pub struct Settings {
     /// Namespace allowed to reach caliband (#57), matched by its
     /// `kubernetes.io/metadata.name` label. `None` means the task's own.
     pub ingress_namespace: Option<String>,
+    /// Elect a leader before running the controllers (#48), so more than one
+    /// replica is safe. On by default: a single replica just acquires the lease
+    /// immediately, and raising `replicaCount` can never silently give two
+    /// controllers force-applying the same objects. Needs the lease RBAC the
+    /// chart's `leaderElection.enabled` grants.
+    pub leader_election: bool,
+    /// Name of the `coordination.k8s.io` Lease the replicas contend for.
+    pub lease_name: String,
+    /// Namespace holding that Lease. `None` means the namespace the operator
+    /// runs in, read from its ServiceAccount at startup.
+    pub lease_namespace: Option<String>,
+    /// How long a lease is held before it may be taken over.
+    pub lease_duration_seconds: u64,
+    /// How long before expiry the holder starts renewing. Must be below
+    /// `lease_duration_seconds`, or the holder can lose the lease while still
+    /// believing it holds it.
+    pub lease_grace_seconds: u64,
     /// Problems found while reading the environment, reported by
     /// [`Settings::validate`] at startup (`from_env` itself cannot fail).
     pub env_errors: Vec<String>,
@@ -100,6 +117,11 @@ impl Default for Settings {
             cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
             ingress_pod_selector: BTreeMap::new(),
             ingress_namespace: None,
+            leader_election: true,
+            lease_name: "caliban-operator".to_string(),
+            lease_namespace: None,
+            lease_duration_seconds: 15,
+            lease_grace_seconds: 5,
             env_errors: Vec::new(),
         }
     }
@@ -132,6 +154,18 @@ impl Settings {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        // #48: a misspelled switch must not quietly decide whether the operator
+        // elects a leader, so an unparseable value is a startup error rather
+        // than a silent fallback to the default.
+        let leader_election = match std::env::var("CALIBAN_LEADER_ELECTION") {
+            Ok(v) => parse_bool_flag(&v).unwrap_or_else(|| {
+                env_errors.push(format!(
+                    "CALIBAN_LEADER_ELECTION: expected 1/true/yes/on or 0/false/no/off, got '{v}'"
+                ));
+                d.leader_election
+            }),
+            Err(_) => d.leader_election,
+        };
         Self {
             caliband_image: std::env::var("CALIBAND_IMAGE").unwrap_or(d.caliband_image),
             caliband_port: std::env::var("CALIBAND_PORT")
@@ -185,6 +219,20 @@ impl Settings {
             cluster_domain: cluster_domain(std::env::var("CALIBAN_CLUSTER_DOMAIN").ok()),
             ingress_pod_selector,
             ingress_namespace,
+            leader_election,
+            lease_name: std::env::var("CALIBAN_LEASE_NAME").unwrap_or(d.lease_name),
+            lease_namespace: std::env::var("CALIBAN_LEASE_NAMESPACE")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            lease_duration_seconds: std::env::var("CALIBAN_LEASE_DURATION_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.lease_duration_seconds),
+            lease_grace_seconds: std::env::var("CALIBAN_LEASE_GRACE_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.lease_grace_seconds),
             env_errors,
         }
     }
@@ -204,6 +252,21 @@ impl Settings {
             if !(1..=65535).contains(&port) {
                 return Err(format!("{name} {port} is outside 1-65535"));
             }
+        }
+        // #48: the holder renews within the grace window, so a grace at or
+        // above the duration leaves no room to renew — the holder can lose the
+        // lease while still believing it holds it, which is the split-brain
+        // leader election exists to prevent. Checked even when election is off,
+        // so a bad value is caught before someone enables it.
+        if self.lease_grace_seconds >= self.lease_duration_seconds {
+            return Err(format!(
+                "CALIBAN_LEASE_GRACE_SECONDS {} must be below CALIBAN_LEASE_DURATION_SECONDS {}, \
+                 or the holder cannot renew before expiry",
+                self.lease_grace_seconds, self.lease_duration_seconds
+            ));
+        }
+        if self.lease_name.trim().is_empty() {
+            return Err("CALIBAN_LEASE_NAME must not be empty".to_string());
         }
         // The sandbox pod sets `runAsNonRoot` (#79), so uid 0 would fail every
         // task at kubelet admission instead of here, where the message names
@@ -288,6 +351,33 @@ const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 /// Resolve the cluster DNS domain from its env value (#54): unset or blank
 /// keeps `cluster.local`; surrounding whitespace and a trailing root dot are
 /// trimmed, so `corp.internal.` doesn't produce `…svc.corp.internal.`.
+/// Parse a boolean env var using caliban's own flag spellings (#48), so one
+/// convention covers the whole system: `1/true/yes/on` and `0/false/no/off`,
+/// case-insensitively. `None` for anything else, which the caller reports as a
+/// startup error rather than guessing.
+pub fn parse_bool_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// The identity this replica claims the leader lease under (#48).
+///
+/// It must differ per replica, or two replicas look like the same holder to
+/// each other and both proceed. A pod name is unique within its namespace, so
+/// the chart passes it via `POD_NAME`; the hostname fallback only matters when
+/// running the operator outside a cluster.
+pub fn leader_identity(pod_name: Option<&str>) -> String {
+    pod_name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()))
+        .unwrap_or_else(|| "caliban-operator".to_string())
+}
+
 pub fn cluster_domain(value: Option<String>) -> String {
     value
         .as_deref()
@@ -599,6 +689,71 @@ mod tests {
         assert!(parse_selector("app").is_err());
         assert!(parse_selector("=prosperod").is_err());
         assert!(parse_selector("app=").is_err());
+    }
+
+    /// #48: both controllers watch cluster-wide with no lease, so raising
+    /// `replicaCount` gave two controllers force-applying the same objects.
+    /// Election is on by default, so that can never happen silently: a single
+    /// replica just acquires the lease immediately.
+    #[test]
+    fn leader_election_is_on_by_default() {
+        let s = Settings::default();
+        assert!(s.leader_election);
+        assert_eq!(s.lease_name, "caliban-operator");
+        assert!(s.lease_duration_seconds > s.lease_grace_seconds);
+    }
+
+    /// The renewal deadline has to leave room to renew: a grace period at or
+    /// above the duration means the holder can lose the lease while it still
+    /// believes it holds it — the split-brain this ticket exists to prevent.
+    #[test]
+    fn validate_rejects_a_lease_grace_that_leaves_no_room_to_renew() {
+        for (duration, grace) in [(15, 15), (5, 30), (1, 1)] {
+            let s = Settings {
+                lease_duration_seconds: duration,
+                lease_grace_seconds: grace,
+                ..Settings::default()
+            };
+            let err = s.validate().unwrap_err();
+            assert!(err.contains("CALIBAN_LEASE_GRACE_SECONDS"), "{err}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_empty_lease_name() {
+        let s = Settings {
+            lease_name: "  ".into(),
+            ..Settings::default()
+        };
+        let err = s.validate().unwrap_err();
+        assert!(err.contains("CALIBAN_LEASE_NAME"), "{err}");
+    }
+
+    /// Boolean env vars follow caliban's own flag spellings, so one convention
+    /// covers the whole system rather than the operator inventing a second.
+    #[test]
+    fn the_bool_env_parser_takes_calibans_flag_spellings() {
+        for t in ["1", "true", "TRUE", "yes", "on"] {
+            assert_eq!(parse_bool_flag(t), Some(true), "{t}");
+        }
+        for f in ["0", "false", "FALSE", "no", "off"] {
+            assert_eq!(parse_bool_flag(f), Some(false), "{f}");
+        }
+        for bad in ["maybe", "", "2"] {
+            assert_eq!(parse_bool_flag(bad), None, "{bad}");
+        }
+    }
+
+    /// The lease holder identity must differ per replica, or two replicas look
+    /// like the same holder to each other and both proceed. The pod name is
+    /// unique in the namespace; the fallback only applies off-cluster.
+    #[test]
+    fn the_lease_identity_is_the_pod_name_when_there_is_one() {
+        assert_eq!(
+            leader_identity(Some("caliban-operator-7d9f-abcde")),
+            "caliban-operator-7d9f-abcde"
+        );
+        assert_ne!(leader_identity(None), "");
     }
 
     /// #79: the sandbox pod sets `runAsNonRoot`, so a root uid would surface

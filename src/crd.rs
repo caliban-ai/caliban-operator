@@ -106,6 +106,14 @@ impl TaskSpec {
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelSpec {
+    /// Model this task's agents use, overriding the model the resolved
+    /// Workspace provider names (#52). Lets a task pick a model without the
+    /// Workspace binding a provider for it. The override is applied to the
+    /// pinned resolution, so it cannot change under a running task, and the
+    /// provider's endpoint and credential still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub name: Option<String>,
     /// Name of a ConfigMap (same namespace) holding the model router config
     /// under the key `caliban.toml`. Mounted read-only into the sandbox and
     /// handed to caliban as `CALIBAN_ROUTER_CONFIG`.
@@ -124,7 +132,16 @@ pub struct StateSpec {
     pub gonzalo_endpoint: Option<String>,
     /// `remote` (shared gonzalod) or `local` (in-pod filesystem). Defaults to
     /// `remote` when `gonzaloEndpoint` is set.
+    // #94: the enum lives in the schema rather than in the Rust type, so the
+    // apiserver refuses a bad mode at admission — as it already did for
+    // `permissionPosture`, a field of the same shape. Kept as a `String`
+    // deliberately: a task stored before this enum existed may hold any value,
+    // and a typed enum would make such an object fail to deserialize, so the
+    // operator could not read it at all. `storage::state_problem` still
+    // rejects an unknown mode at reconcile time, which is what those
+    // pre-existing objects get.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = ["remote", "local"]))]
     pub mode: Option<String>,
     /// Secret holding the gonzalod bearer token, projected into the pod as
     /// `GONZALO_TOKEN`. Requires remote storage. caliban-memory and
@@ -164,6 +181,13 @@ pub struct LifecycleSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_timeout: Option<String>,
     /// On delete: `checkpoint` or `delete`.
+    // #94 asked whether to honour or remove this. It stays: #42 implements it
+    // (drain finalizer → `Draining` phase → `status.checkpointRef`, designed in
+    // caliban ADR 0057), and that ticket waits only on prospero reporting
+    // `AgentsDrained` (prospero#230/#231). Removing it would churn the API and
+    // then re-add the same field. No schema `enum` here for the same reason:
+    // the accepted values belong with the logic that reads them, and pinning
+    // them now would freeze a surface #42 may still refine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_delete: Option<String>,
 }
@@ -410,6 +434,57 @@ spec:
         // camelCase key survives re-serialization (prospero reads it back).
         let json = serde_json::to_value(&task.spec).unwrap();
         assert_eq!(json["task"]["interactive"], serde_json::json!(true));
+    }
+
+    /// #94: `state.mode` was validated at reconcile time while
+    /// `permissionPosture` — the same kind of closed set — was refused at
+    /// admission. The apiserver now refuses a bad mode too, so the two fail at
+    /// the same moment.
+    ///
+    /// The schema carries the enum while the Rust type stays a `String` on
+    /// purpose: a task stored before this enum existed may hold any value, and
+    /// a typed enum would make such an object fail to deserialize, so the
+    /// operator could not read it at all — worse than the clear `Failed`
+    /// status the reconcile-time check still produces for it.
+    #[test]
+    fn crd_state_mode_is_refused_at_admission() {
+        let crd = CalibanTask::crd();
+        let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
+        let mode = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"]["state"]
+            ["properties"]["mode"];
+        let got: Vec<&str> = mode["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("state.mode is an enum: {mode}"))
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(got, vec!["remote", "local"], "{mode}");
+        // Still optional: an unset mode with an endpoint means remote.
+        assert!(
+            schema["openAPIV3Schema"]["properties"]["spec"]["properties"]["state"]["required"]
+                .as_array()
+                .is_none_or(|r| !r.iter().any(|v| v == "mode")),
+            "mode must stay optional"
+        );
+    }
+
+    /// #52: a task may name its own model without the workspace binding a
+    /// whole new provider for it. Optional, and non-empty when given — a blank
+    /// model is a misconfiguration, not a selection.
+    #[test]
+    fn crd_model_name_is_an_optional_non_empty_string() {
+        let crd = CalibanTask::crd();
+        let schema = serde_json::to_value(&crd.spec.versions[0].schema).unwrap();
+        let model = &schema["openAPIV3Schema"]["properties"]["spec"]["properties"]["model"];
+        let name = &model["properties"]["name"];
+        assert_eq!(name["type"], "string", "{model}");
+        assert_eq!(name["minLength"].as_f64(), Some(1.0), "{model}");
+        assert!(
+            model["required"]
+                .as_array()
+                .is_none_or(|r| !r.iter().any(|v| v == "name")),
+            "name must stay optional: {model}"
+        );
     }
 
     #[test]
