@@ -1,7 +1,11 @@
 # syntax=docker/dockerfile:1
 
 # ---- builder ----
-FROM rust:1.95-bookworm AS builder
+# Only the major version is pinned here (#90). `COPY . .` brings
+# rust-toolchain.toml into the context, and rustup in this image honours it, so
+# the exact toolchain comes from that file alone — pinning it here too would be
+# a second source of truth for one value, and the two would drift.
+FROM rust:1-bookworm AS builder
 WORKDIR /src
 # rustls (ring) + kube; no openssl/protoc/git2 native deps, so the base image's
 # toolchain is sufficient — no extra apt.
