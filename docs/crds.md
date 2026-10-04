@@ -79,11 +79,53 @@ replacing the default allow-all rule. An **empty `allow` list is DNS-only**.
 When you set `egress`, remember to include the workspace's **git remotes**, its
 **model provider endpoints**, and **gonzalod** if a task uses `spec.state`.
 
-`agentPolicy`:
+#### `agentPolicy` — what agents in this workspace may do
+
+Typed settings for caliban's own permission and extension surface, so a cluster
+author configures them as CRD fields rather than as raw `env` entries. They win
+over an `env` entry of the same name. **Every field is optional, and an unset
+field leaves caliban's own default alone** — which is not the same as setting it
+to `false`.
+
+The whole block is pinned into `status.resolvedWorkspace.agentPolicy` with the
+rest of the Workspace, so it cannot change under a running task.
+
+**The authorization switch:**
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `agentPolicy.allowUnattended` | bool | `false` | Admits tasks whose `permissionPosture` is `unattended`. **Whoever can edit this Workspace controls it — treat Workspace write access as privileged** ([ADR 0006](adr/0006-unattended-permission-posture-authorized-by-workspace-policy.md)). |
+| `allowUnattended` | bool | `false` | Authorizes *both* a task asking for `permissionPosture: unattended` *and* the unsupervised settings in the next table. **Whoever can edit this Workspace controls it — treat Workspace write access as privileged** ([ADR 0006](adr/0006-unattended-permission-posture-authorized-by-workspace-policy.md)). |
+
+**Permission settings.** The three marked ⚠ leave no human answering prompts, so
+each is admitted **only** when `allowUnattended: true` — otherwise the task is
+denied before pinning with reason `PostureNotPermitted`, and the message names
+the setting. One switch is the whole answer to "may agents here run
+unsupervised?", so the same power cannot be reached through a back door
+(ADR 0006, decision 7).
+
+| Field | Type | Notes |
+|---|---|---|
+| `permissionMode` | enum | `default`, `acceptEdits`, `plan`, `auto`, **⚠ `dontAsk`**, **⚠ `bypassPermissions`**. Projected as `CALIBAN_DEFAULT_PERMISSION_MODE`; caliban's own `--permission-mode` flag still wins over it. `dontAsk` turns every `Ask` into `Allow` by caliban's definition, so it grants what `bypassPermissions` does; `auto` still classifies each call, so it does **not** count as unsupervised. |
+| `autoAllow` | bool | **⚠** Allow tools that would otherwise prompt. `CALIBAN_AUTO_ALLOW`. |
+| `noPermissions` | bool | **⚠** Disable permission gating altogether — the bluntest lever. `CALIBAN_NO_PERMISSIONS`. |
+
+**Extension settings.** These *reduce* what an agent can reach rather than
+granting it power, so none of them needs `allowUnattended`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `noMcp` | bool | No MCP server discovery. `CALIBAN_NO_MCP`. |
+| `noHooks` | bool | Bypass every external hook handler; caliban's in-process hooks still run. `CALIBAN_NO_HOOKS`. |
+| `noSkills` | bool | No skill discovery at startup. `CALIBAN_NO_SKILLS`. |
+| `noSubAgent` | bool | Disable the built-in agent tool, so an agent cannot spawn sub-agents. `CALIBAN_NO_SUB_AGENT`. |
+| `strictKnownMarketplaces` | bool | Block plugin installs from marketplaces caliban does not recognise. `CALIBAN_STRICT_KNOWN_MARKETPLACES`. |
+| `enabledPlugins[]` | list of string | An **allow-list**: every other discovered plugin is disabled. `CALIBAN_ENABLED_PLUGINS`, comma-joined. An **empty list enables none**, which is deliberately different from omitting the field — omitted enables everything caliban discovers, so the two cannot be collapsed. |
+| `blockedMarketplaces[]` | list of string | Marketplace names to block; unset blocks none. `CALIBAN_BLOCKED_MARKETPLACES`, comma-joined. |
+| `parallelToolLimit` | integer ≥ 1 | Maximum concurrent tool invocations per turn. `CALIBAN_PARALLEL_TOOL_LIMIT`. The schema enforces `minimum: 1` because caliban refuses `0` at startup; unset leaves caliban's default of one less than the CPU count. |
+
+Unlike a task's own posture, this policy is checked at **admission only**. It
+travels inside the pin, so it cannot change under a running task — and revoking
+a setting therefore does not disturb a task already running.
 
 ### `status`
 
@@ -122,9 +164,10 @@ token-less ServiceAccount and a NetworkPolicy
 | `task.agentType` | string | no | — | carried on the CR; the operator does not read it |
 | `task.interactive` | bool | no | `false` | prospero (`SpawnSpec.interactive`); the operator only carries it |
 | `task.permissionPosture` | enum | no | `supervised` | operator (admission gate) + prospero |
+| `model.name` | string (min 1) | no | the resolved provider's `model` | operator (written into the pin) |
 | `model.routerConfigRef` | string | no | — | operator |
 | `state.gonzaloEndpoint` | string | no | — | operator |
-| `state.mode` | string: `remote` \| `local` | no | `remote` when `gonzaloEndpoint` is set | operator |
+| `state.mode` | enum: `remote` \| `local` | no | `remote` when `gonzaloEndpoint` is set | operator |
 | `state.tokenRef` | `{secretName, key}` | no | — | operator |
 | `isolation.runtimeClass` | string | no | the workspace default | operator (pod `runtimeClassName`) |
 | `isolation.worktrees` | string | no | — | declared, not yet consumed |
@@ -133,11 +176,41 @@ token-less ServiceAccount and a NetworkPolicy
 | `lifecycle.onDelete` | string: `checkpoint` \| `delete` | no | — | declared; the drain finalizer is deferred |
 | `tools[]` | list of string | no | — | declared, not yet consumed |
 
-Only `permissionPosture` carries an `enum` in the generated schema, so only it is
-rejected by the API server on a typo. `state.mode` is a plain string the operator
-validates at reconcile time (failing the task with `InvalidState`); the strings in
-the deferred `isolation.worktrees`, `resources.class` and `lifecycle.*` fields are
-unconstrained and unread.
+**Which closed sets the API server enforces.** `task.permissionPosture`,
+`state.mode` and the Workspace's `agentPolicy.permissionMode` carry an `enum` in
+the generated schema, so a typo in any of them is **rejected at admission**.
+
+`state.mode` is a deliberate hybrid: the enum lives in the schema while the Rust
+type stays a `String`. A task stored before the enum existed may hold any value,
+and a typed enum would make such an object fail to deserialize — the operator
+could not read it at all. So `storage::state_problem` still rejects an unknown
+mode at reconcile time (`InvalidState`), which is what those pre-existing objects
+get.
+
+The strings in `isolation.worktrees`, `resources.class` and `lifecycle.*` carry
+**no** schema enum and are unread. For `lifecycle.onDelete` that is deliberate
+rather than an oversight: #42 implements it (drain finalizer → `Draining` phase →
+`status.checkpointRef`, designed in caliban ADR 0057) and waits only on prospero
+reporting `AgentsDrained`, so pinning the accepted values now would freeze a
+surface that work may still refine.
+
+#### `model.name` — per-task model override
+
+A task may name its own model without the `Workspace` binding a whole new
+provider for it. The override is applied to the **pinned** resolution, so:
+
+- the bound provider's **endpoint and credential still apply** — only the model
+  moves;
+- it cannot change under a running task, like everything else in the pin
+  (ADR 0004);
+- prospero needs no change, since it already builds `SpawnSpec.model` from the
+  pinned provider.
+
+It is applied after admission, because which model to run is not an
+admissibility question. A **blank** name is treated as a misconfiguration rather
+than a selection: it leaves the provider's model alone instead of clearing it,
+and the schema's `minLength: 1` rejects it outright. `model.name` is independent
+of `model.routerConfigRef` and may be set alongside it.
 
 `spec.isolation` is a **per-run override that wins over the workspace default**.
 That is exactly why `egress` and `agentPolicy` are Workspace-level fields and
@@ -157,6 +230,11 @@ before the field existed — does not permit it. The check runs **before pinning
 so a denied task is never pinned to the policy that denied it; allowing it on the
 Workspace, or editing the task back to `supervised`, recovers it. The operator
 never silently downgrades a posture.
+
+The same switch also authorizes the Workspace's own unsupervised `agentPolicy`
+settings, so a task is denied with the same `PostureNotPermitted` reason whether
+the unsupervised power was asked for by the task or by the workspace — see
+[`agentPolicy`](#agentpolicy--what-agents-in-this-workspace-may-do).
 
 A pinned task is re-checked against **its pin** on every reconcile. Revoking
 `allowUnattended` therefore does not disturb a task already running, but editing
@@ -231,7 +309,7 @@ finished task stays `Running`.
 | `InvalidName` | `False` | The task name is too long for its Sandbox's Service name (`<task>-sbx`, max 63 chars). Names are immutable — recreate under a shorter name. The operator stops retrying. |
 | `WorkspaceUnresolved` | `False` | No such `Workspace`, a `Failed` one, or an unresolvable/ambiguous `providerRef`. `message` names which. Re-checked every 30s; fixing the `Workspace` recovers the task. |
 | `InvalidState` | `False` | `spec.state` is malformed or its token Secret is missing. Re-checked every 30s. |
-| `PostureNotPermitted` | `False` | `unattended` without `agentPolicy.allowUnattended`. Re-checked every 30s. |
+| `PostureNotPermitted` | `False` | Unsupervised power without `agentPolicy.allowUnattended` — either the task's `permissionPosture: unattended` or the Workspace's own `permissionMode: dontAsk`/`bypassPermissions`, `autoAllow`, `noPermissions`. `message` names which setting. Re-checked every 30s. |
 
 `AgentsSettled` reasons are prospero's: `Succeeded`, `Failed`, or `AgentsActive`
 (not settled — an idle interactive task stays unsettled).

@@ -14,9 +14,12 @@ workloads. It composes the Kubernetes SIG
 > cross-repo k8s system-design spec in the caliban-ai docs hub, and the umbrella
 > epic [caliban-ai/caliban#274](https://github.com/caliban-ai/caliban/issues/274).
 >
+> Leader election is on by default, so more than one replica is safe (#48).
+>
 > Not yet implemented: the drain/checkpoint lifecycle (so `Draining` is never
-> reached and a deleted task is torn down without checkpointing), warm pools and
-> `SandboxTemplate` selection, and leader election (run a single replica).
+> reached and a deleted task is torn down without checkpointing — #42, waiting on
+> prospero reporting `AgentsDrained`), and warm pools / `SandboxTemplate`
+> selection.
 
 - **[CRD reference](docs/crds.md)** — every `Workspace` and `CalibanTask` field,
   its default, phases, conditions and Events.
@@ -86,13 +89,16 @@ consequence worth knowing: without prospero deployed, a finished task stays
   the default allow-all egress with DNS plus exactly the listed CIDRs/ports. It is
   a Workspace-level field precisely so a task's own `spec.isolation` override
   cannot widen it.
-- **Unattended agents need a Workspace to authorize them.**
-  `CalibanTask.spec.task.permissionPosture: unattended` is admitted only under a
-  `Workspace` setting `agentPolicy.allowUnattended: true` — checked before
-  pinning, failing closed with reason `PostureNotPermitted`
-  ([ADR 0006](docs/adr/0006-unattended-permission-posture-authorized-by-workspace-policy.md)).
-  The gate is only as strong as Workspace RBAC: **treat write access to
-  `workspaces` as privileged.**
+- **Unsupervised agents need a Workspace to authorize them — through one
+  switch.** `agentPolicy.allowUnattended: true` gates *both* a task asking for
+  `permissionPosture: unattended` *and* the Workspace's own unsupervised
+  settings (`permissionMode: dontAsk` or `bypassPermissions`, `autoAllow: true`,
+  `noPermissions: true`). Either way the check runs before pinning and fails
+  closed with reason `PostureNotPermitted`, naming what was set, so the same
+  power cannot have one gated door and one ungated one
+  ([ADR 0006](docs/adr/0006-unattended-permission-posture-authorized-by-workspace-policy.md),
+  decision 7). The gate is only as strong as Workspace RBAC: **treat write
+  access to `workspaces` as privileged.**
 - **Sandbox pods run non-root**, every container as one uid/gid with `fsGroup`
   set to match, so the git-clone step and the agent cannot drift apart.
 
