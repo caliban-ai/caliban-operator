@@ -88,6 +88,18 @@ per-change detail used from v0.6.0 onwards.
   brought current, README moved to v0.6.0, and the missing ADR template restored
   (PR #86)
 
+- This file, and an mdBook guide published from `docs/guide/`. The operator was
+  the only repo in the suite with neither. The guide ingests the ADR log, this
+  changelog and the three reference docs at build time, so each has exactly one
+  editable copy (#92, PR #100)
+
+- Six append-only notes recording where the code has overtaken ADRs 0001, 0002
+  and 0003 — the `volumeClaimTemplates` type, two `Sandbox` fields that were
+  never declared, the control-plane TLS environment variables removed in #59, the
+  now-configurable cluster DNS domain, `serde_yaml` → `serde_norway`, and the
+  target cluster moving to k3s v1.36. No decision prose was altered
+  (#93, PR #101)
+
 ## [0.6.0] - 2026-09-19
 
 Per-session permission posture, and caliband's launch surface sourced from the
