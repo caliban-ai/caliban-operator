@@ -145,3 +145,19 @@ Forces:
   `IsolationSpec`, because `CalibanTaskSpec.isolation` is a per-run override that
   wins over the workspace default and would otherwise let a task widen the
   restriction. Malformed CIDRs and out-of-range ports fail the Workspace.
+- **`volumeClaimTemplates` could not reuse `PersistentVolumeClaim`** — _superseded
+  (#7/#8)._ Decision 1 says the `Sandbox` view's `volumeClaimTemplates` reuses
+  `k8s_openapi`'s `PersistentVolumeClaim`. It cannot: that type serializes its
+  group/version/kind, and agent-sandbox v0.5.0's structural schema rejects those on
+  server-side apply (`.spec.volumeClaimTemplates[].apiVersion: field not declared in
+  schema`), failing every reconcile. `src/sandbox.rs` declares a bare
+  `VolumeClaimTemplate` (`metadata` + `spec`) instead, which is what the upstream
+  schema actually describes. `podTemplate` does still reuse `PodTemplateSpec` as
+  decision 1 says.
+- **The `Sandbox` view omits `shutdownPolicy` and `shutdownTime`** — _not
+  implemented._ Decision 1 lists both among the fields the view declares; it
+  declares `podTemplate`, `service`, `operatingMode` and `volumeClaimTemplates`
+  only. Nothing sets a shutdown policy today, and the view is deliberately a
+  read/write subset — fields it omits are pruned by the API server, so the gap is
+  inert rather than a defect. It is recorded here because decision 1 reads as a
+  complete list and is not one.
