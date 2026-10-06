@@ -61,6 +61,9 @@ jobs:
       - name: Build the guide
         run: mdbook build docs/guide
 
+      - name: Check internal links
+        run: ./docs/guide/check-links.sh
+
       - name: Build API docs (rustdoc)
         run: cargo doc --workspace --no-deps
 
