@@ -1,0 +1,20 @@
+[book]
+title = "caliban-operator"
+description = "Kubernetes operator for caliban agent workloads."
+authors = ["caliban-ai"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/caliban-ai/caliban-operator"
+preferred-dark-theme = "navy"
+additional-css = ["theme/caliban-ai.css"]
+additional-js = ["theme/nav.js"]
+no-section-label = true
+
+[output.html.search]
+enable = true
