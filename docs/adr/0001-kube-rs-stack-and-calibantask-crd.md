@@ -81,3 +81,18 @@ Constraints and forces:
   `v1_32` `k8s-openapi` surface needs raising (or drops below the tolerated skew
   with k3s v1.31); or agent-sandbox's own API (consumed from #283) forces a
   different `k8s-openapi` pairing.
+- **`serde_yaml` was replaced by `serde_norway`** — _superseded._ Decision 1 lists
+  `serde_yaml` in the stack. It was unmaintained and carried a RUSTSEC advisory, so
+  the dependency is now `serde_norway`, its maintained fork, with the same role
+  (CRD YAML generation) and a compatible API. The decision — generate the CRD YAML
+  from the Rust types and commit it — is unchanged; only the crate that does it
+  moved.
+- **The target cluster has moved to k3s v1.36** — _context changed._ The Context
+  and decision 2 are written against **k3s v1.31**, and the "Revisit if" clause
+  above names the cluster version moving as a trigger. It has: the homelab now runs
+  **k3s v1.36** (see [Deploying](../deploying.md)). `k8s-openapi` is still pinned to
+  `v1_32`, which remains within the tolerated skew and compiles against a surface
+  older than the server — the forward-compatible direction, and the one the decision
+  intended. No change is required today; this is recorded so the version in the
+  Context is not read as current, and so the trigger is visibly accounted for rather
+  than silently passed.

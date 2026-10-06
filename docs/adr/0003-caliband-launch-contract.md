@@ -108,3 +108,19 @@ the caliban image's Dockerfile:
   `CALIBAN_STORAGE_REMOTE_TOKEN_ENV=GONZALO_TOKEN` with `GONZALO_TOKEN` from the referenced
   Secret. The operator sets caliban's settings by environment rather than authoring its
   settings file (ADR 0005). Requires a caliban build that includes #659.
+- **The control-plane TLS env vars are no longer published** — _resolved (#59)._
+  The note above still says the operator "publishes `CALIBAN_CONTROL_TLS_CA` +
+  `CALIBAN_CONTROL_TLS_SERVER_NAME` on the caliband container, which the workers
+  inherit". It no longer does. caliband ≥ 0.8.0 (caliban#510, #512) sets both on
+  each worker it spawns, explicitly, from its own `--tls-ca` / `--tls-server-name`
+  — and the operator passes both flags. Publishing the same values in the pod env
+  was therefore a second mechanism that the argv overrides and that could only
+  drift from it, so it was removed. Inheritance is not how the workers get these
+  values; caliband sets them. `caliband_env_carries_no_control_plane_tls_vars`
+  keeps them out.
+- **The cluster DNS domain is no longer hardcoded** — _resolved (#54)._ The
+  `advertise-host` note above writes `<sandbox>.<ns>.svc.cluster.local` as a fixed
+  suffix. The domain is now `CALIBAN_CLUSTER_DOMAIN`, defaulting to
+  `cluster.local`, so the behaviour described is the default rather than the only
+  possibility. A cluster served under another domain no longer gets an unreachable
+  advertise host.
