@@ -8,6 +8,10 @@ workloads. It composes the Kubernetes SIG
 [agent-sandbox](https://agent-sandbox.sigs.k8s.io) project and reconciles a
 `Workspace` + `CalibanTask` pair of custom resources into a sandboxed agent pod.
 
+**Guide:** <https://caliban-ai.github.io/caliban-operator/>. It covers the CRD
+reference, deploying and configuring the operator, the container image, the
+changelog and the architecture decisions.
+
 > **Status:** both CRDs and both reconcile loops are implemented and running in a
 > homelab cluster. The API is `v1alpha1` and may still change without conversion
 > webhooks. See [`docs/adr/`](docs/adr/README.md) for the accepted decisions, the
@@ -26,6 +30,7 @@ workloads. It composes the Kubernetes SIG
 - **[Deploying and configuring](docs/deploying.md)** — prerequisites, every
   environment variable, the RBAC the operator needs, and troubleshooting.
 - **[Container image](docs/container.md)** — what ships and how it is built.
+- **[Changelog](CHANGELOG.md)** — what changed in each release.
 - **[Samples](deploy/samples/)** and **[generated CRDs](deploy/crd/)**.
 
 ## Role in the system

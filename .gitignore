@@ -20,8 +20,18 @@ Cargo.lock.bak
 .caliban/
 .claude/
 
+# Built mdBook output
+/docs/guide/book
+
 # Generated ADR copies for the mdBook guide (source of truth: docs/adr/)
 /docs/guide/src/adr/
+
+# Generated chapter copies for the mdBook guide (source of truth: the originals
+# at the repo root and in docs/, which README.md links to directly)
+/docs/guide/src/changelog.md
+/docs/guide/src/crds.md
+/docs/guide/src/deploying.md
+/docs/guide/src/container.md
 
 # Shared theme files fetched from the hub at build time (source: caliban-ai.github.io)
 /docs/guide/theme/caliban-ai.css
