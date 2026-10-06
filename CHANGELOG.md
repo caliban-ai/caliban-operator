@@ -19,6 +19,26 @@ per-change detail used from v0.6.0 onwards.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-06
+
+The release that makes a second replica safe, and moves the agent's posture out of
+untyped `env` and into the API.
+
+Leader election is on by default, so `replicas: 2` is a standby rather than a race.
+A `Workspace` now declares its agent policy as typed fields the operator validates
+and projects — and the settings that leave an agent unsupervised are admitted only
+where the Workspace authorizes them, extending ADR 0006's rule to the policy itself.
+A task can override just the model. The sandbox pod runs as the agent's own uid, so
+clones it writes are usable.
+
+```text
+Needs caliban-crds >= 0.2.9 for the agentPolicy fields, model.name and the
+state.mode enum, and the Lease RBAC from caliban-operator chart >= 0.2.11.
+Upgrading begins enforcing the unsupervised-policy gate: a Workspace that sets
+permissionMode dontAsk/bypassPermissions or noPermissions without
+agentPolicy.allowUnattended is refused, fail-closed, where v0.6.0 ignored it.
+```
+
 ### Added
 
 - **Leader election, on by default.** The controller acquires a `coordination.k8s.io`
@@ -99,6 +119,23 @@ per-change detail used from v0.6.0 onwards.
   now-configurable cluster DNS domain, `serde_yaml` → `serde_norway`, and the
   target cluster moving to k3s v1.36. No decision prose was altered
   (#93, PR #101)
+
+- The guide's published links are now checked. Crawling the newly published site
+  found three 404s on the ADR 0000 page — `template.md`, `README.md` and a
+  bootstrap-spec reference — each correct as a file on GitHub and dead once
+  rendered, because only files listed in `SUMMARY.md` become pages. The ADR
+  ingest now rewrites links that leave the book to absolute URLs, protecting the
+  ingested chapters so an in-book `../<chapter>.md` still resolves, and covering
+  both the inline `](url)` and reference `[label]: url` forms. The bootstrap
+  reference points at caliban, where that document actually lives — it had never
+  resolved in this repo. `check-links.sh` runs in `docs.yml` and resolves every
+  internal href, plus any link back into this repository, against what the build
+  produced; it was proven to fail by re-introducing a dead link. mdBook validates
+  no markdown links, so all three had published with **zero build warnings**
+  (PR #103, PR #104)
+
+- Changelog catch-up: #100 and #101 were missing from the file #100 created
+  (PR #102)
 
 ## [0.6.0] - 2026-09-19
 
@@ -234,7 +271,8 @@ First release that reconciles end to end.
   publishes `ghcr.io/caliban-ai/caliban-operator` on `v*` tags
   (caliban-ai/caliban#358, PR #5)
 
-[Unreleased]: https://github.com/caliban-ai/caliban-operator/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/caliban-ai/caliban-operator/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/caliban-ai/caliban-operator/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/caliban-ai/caliban-operator/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/caliban-ai/caliban-operator/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/caliban-ai/caliban-operator/compare/v0.3.1...v0.4.0
