@@ -55,4 +55,9 @@ sibling repos prospero and gonzalo. Specifically:
 - **Revisit if:** the agreed cross-sibling ADR standard changes, or the `docs/adr/`
   layout proves harder to maintain than the root placement it replaced.
 
-[bootstrap]: ../superpowers/specs/2026-05-22-layer-0-bootstrap-design.md
+<!-- The Layer-0 bootstrap design is a caliban document, and this reference was
+     relative when this record was adapted from caliban's ADR log. There is no
+     docs/superpowers/specs/ in this repo, so the relative form resolved nowhere
+     — on GitHub or in the published guide. -->
+
+[bootstrap]: https://github.com/caliban-ai/caliban/blob/main/docs/superpowers/specs/2026-05-22-layer-0-bootstrap-design.md

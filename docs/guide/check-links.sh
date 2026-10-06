@@ -14,6 +14,8 @@
 set -uo pipefail
 
 BOOK="${1:-docs/guide/book}"
+SELF_BLOB="https://github.com/caliban-ai/caliban-operator/blob/main"
+SELF_TREE="https://github.com/caliban-ai/caliban-operator/tree/main"
 
 if [[ ! -d "$BOOK" ]]; then
   echo "error: $BOOK not found (run 'mdbook build docs/guide' first)" >&2
@@ -29,6 +31,26 @@ while IFS= read -r page; do
   [[ "$dir" == "." ]] && dir=""
 
   while IFS= read -r href; do
+    # A link the ingests rewrote to point back at this repository names a path
+    # that must exist here. Resolve it against the working tree rather than
+    # fetching it -- a rewrite aimed at a path that does not exist publishes as
+    # a link out to a 404, which is how the ADR 0000 bootstrap reference stayed
+    # broken through its first "fix".
+    case "$href" in
+      "$SELF_BLOB"/*|"$SELF_TREE"/*)
+        path="${href#"$SELF_BLOB"/}"
+        path="${path#"$SELF_TREE"/}"
+        path="${path%%#*}"
+        path="${path%/}"
+        checked=$((checked + 1))
+        if [[ -n "$path" && ! -e "$path" ]]; then
+          echo "broken: $rel -> $href (no such path in this repo: $path)"
+          broken=$((broken + 1))
+        fi
+        continue
+        ;;
+    esac
+
     case "$href" in
       http*|//*|'#'*|mailto:*|'') continue ;;
     esac
